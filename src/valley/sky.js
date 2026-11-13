@@ -148,39 +148,52 @@ uniform vec2 uBackdropEl;
 void main() {
   vec3 d = normalize(vDir);
   float h = max(d.y, 0.0);
-  vec3 col = mix(uHorizon, uMid, smoothstep(0.0, 0.3, pow(h, 0.8)));
+  vec3 col = mix(uHorizon, uMid, smoothstep(0.0, 0.3, h > 0.0 ? pow(h, 0.8) : 0.0));
   col = mix(col, uZenith, smoothstep(0.18, 0.85, h));
   float sd = max(dot(d, uSunDir), 0.0);
-  col += uGlow * (pow(sd, 6.0) * 0.05 + pow(sd, 90.0) * 0.3 + pow(sd, 1400.0) * 1.4) + uSunColor * smoothstep(0.99988, 0.99996, sd) * 8.0;
+  float sd6 = 0.0;
+  if (sd > 0.0) {
+    float sd2 = sd * sd;
+    sd6 = sd2 * sd2 * sd2;
+    float halo = sd6 * 0.05;
+    if (sd > 0.85) halo += pow(sd, 90.0) * 0.3;
+    if (sd > 0.985) halo += pow(sd, 1400.0) * 1.4;
+    col += uGlow * halo;
+    if (sd > 0.999) col += uSunColor * smoothstep(0.99988, 0.99996, sd) * 8.0;
+  }
   vec4 c = texture(tClouds, d);
   // towards the sun a cloud's edge is lit through
-  c.rgb += uGlow * pow(sd, 40.0) * 0.5 * c.a * (1.0 - c.a) * 4.0;
+  if (sd > 0.7 && c.a > 0.001 && c.a < 0.999) {
+    c.rgb += uGlow * pow(sd, 40.0) * 0.5 * c.a * (1.0 - c.a) * 4.0;
+  }
   col = col * (1.0 - c.a) + c.rgb;
   // the far country stands in front of the clouds, mixed from its paint with this hour's light
-  float v = (asin(clamp(d.y, -1.0, 1.0)) - uBackdropEl.x) / (uBackdropEl.y - uBackdropEl.x);
   float done = 0.0;
-  if (v < 1.0) {
-    vec2 uv = vec2(atan(d.z, d.x) / TAU + 0.5, max(v, 0.0));
-    vec4 b0 = textureLod(tBack0, uv, 0.0);
-    if (b0.a > 0.002) {
-      vec4 b1 = textureLod(tBack1, uv, 0.0);
-      vec4 b2 = textureLod(tBack2, uv, 0.0);
-      float inv = 1.0 / b0.a;
-      // how much of what is here is the bank of cloud, and how much the land behind it
-      float bank = clamp(b2.b * inv, 0.0, 1.0);
-      float w = inv / max(1.0 - bank, 1e-3);
-      vec3 ambient = uSkyColor * 0.6 + dot(uSkyColor, vec3(0.38));
-      vec3 inLight = b0.rgb * w;
-      vec3 inShade = b1.rgb * w;
-      vec3 land = mix(inShade * inShade * ambient, inLight * inLight * (uSunColor * 0.42 + uSkyColor * 0.35), clamp(b1.a * w, 0.0, 1.0));
-      // (towards a low sun the far country warms, but it is not set alight)
-      vec3 air = mix(uFogColor, uFogSunColor, pow(sd, 6.0) * 0.45);
-      land = mix(land, air, 1.0 - pow(1.0 - clamp(b2.r * w, 0.0, 0.996), uFogDensity / 0.00015));
-      land = mix(land, vec3(0.86, 0.92, 1.0) * (uSkyColor * 0.5 + uSunColor * 0.26), clamp(b2.g * w, 0.0, 1.0));
-      vec3 cloud = mix(uBankShade, uBankLit, clamp(b2.a * inv / max(bank, 1e-3), 0.0, 1.0) * (0.2 + 0.8 * smoothstep(0.04, 0.4, uSunDir.y)));
-      land = mix(land, mix(cloud, air, 0.18), bank);
-      col = mix(col, land, b0.a);
-      done = b0.a * (1.0 - bank);
+  if (d.y < sin(uBackdropEl.y)) {
+    float v = (asin(clamp(d.y, -1.0, 1.0)) - uBackdropEl.x) / (uBackdropEl.y - uBackdropEl.x);
+    if (v < 1.0) {
+      vec2 uv = vec2(atan(d.z, d.x) / TAU + 0.5, max(v, 0.0));
+      vec4 b0 = textureLod(tBack0, uv, 0.0);
+      if (b0.a > 0.002) {
+        vec4 b1 = textureLod(tBack1, uv, 0.0);
+        vec4 b2 = textureLod(tBack2, uv, 0.0);
+        float inv = 1.0 / b0.a;
+        // how much of what is here is the bank of cloud, and how much the land behind it
+        float bank = clamp(b2.b * inv, 0.0, 1.0);
+        float w = inv / max(1.0 - bank, 1e-3);
+        vec3 ambient = uSkyColor * 0.6 + dot(uSkyColor, vec3(0.38));
+        vec3 inLight = b0.rgb * w;
+        vec3 inShade = b1.rgb * w;
+        vec3 land = mix(inShade * inShade * ambient, inLight * inLight * (uSunColor * 0.42 + uSkyColor * 0.35), clamp(b1.a * w, 0.0, 1.0));
+        // (towards a low sun the far country warms, but it is not set alight)
+        vec3 air = mix(uFogColor, uFogSunColor, sd6 * 0.45);
+        land = mix(land, air, 1.0 - pow(1.0 - clamp(b2.r * w, 0.0, 0.996), uFogDensity / 0.00015));
+        land = mix(land, vec3(0.86, 0.92, 1.0) * (uSkyColor * 0.5 + uSunColor * 0.26), clamp(b2.g * w, 0.0, 1.0));
+        vec3 cloud = mix(uBankShade, uBankLit, clamp(b2.a * inv / max(bank, 1e-3), 0.0, 1.0) * (0.2 + 0.8 * smoothstep(0.04, 0.4, uSunDir.y)));
+        land = mix(land, mix(cloud, air, 0.18), bank);
+        col = mix(col, land, b0.a);
+        done = b0.a * (1.0 - bank);
+      }
     }
   }
   // (alpha marks what is painted already and wants no more of the brush: the far country)
@@ -238,7 +251,7 @@ export function createSky(renderer, field, { parts = null, ...options } = {}) {
   const material = new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, vertexShader: vertex, fragmentShader: fragment, uniforms, side: THREE.BackSide, depthWrite: false, depthTest: true });
   const mesh = new THREE.Mesh(new THREE.IcosahedronGeometry(1, 4), material);
   mesh.frustumCulled = false;
-  mesh.renderOrder = -10;
+  mesh.renderOrder = 50;
 
   const sunDir = new THREE.Vector3();
   const c = { sun: colour(), amb: colour(), bounce: colour(), fog: colour(), fogSun: colour(), lit: colour(), mid: colour(), shade: colour(), under: colour() };

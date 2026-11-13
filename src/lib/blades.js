@@ -9,10 +9,10 @@ import { mulberry } from './noise.js';
 
 /** cell: metres between blades. tile × tiles: the square of ground a ring covers. fade: in from, to; out from, to. */
 export const RINGS = [
-  { name: 'near', cell: 0.05, tile: 3, tiles: 6, rows: 8, sub: 1, fade: [-2, -1, 2.8, 6], width: 1, tops: 0 },
-  { name: 'mid', cell: 0.09, tile: 7.2, tiles: 8, rows: 4, sub: 1, fade: [2.8, 6, 13, 21.6], width: 2.0, tops: 0.05 },
-  { name: 'wide', cell: 0.2, tile: 16, tiles: 8, rows: 3, sub: 1, fade: [13, 21.6, 34, 48], width: 4.6, tops: 0.22 },
-  { name: 'far', cell: 0.625, tile: 40, tiles: 8, rows: 3, sub: 3, fade: [34, 48, 96, 120], width: 10, tops: 0.4 },
+  { name: 'near', cell: 0.06, tile: 3, tiles: 6, rows: 5, sub: 1, fade: [-2, -1, 2.8, 6], width: 1.2, tops: 0 },
+  { name: 'mid', cell: 0.11, tile: 7.2, tiles: 8, rows: 3, sub: 1, fade: [2.8, 6, 13, 21.6], width: 2.4, tops: 0.05 },
+  { name: 'wide', cell: 0.26, tile: 16, tiles: 8, rows: 2, sub: 1, fade: [13, 21.6, 34, 48], width: 6.0, tops: 0.22 },
+  { name: 'far', cell: 0.7, tile: 40, tiles: 8, rows: 2, sub: 2, fade: [34, 48, 96, 120], width: 14.5, tops: 0.4 },
 ];
 
 const vertex = /* glsl */ `
@@ -36,15 +36,15 @@ out vec2 vLight;  // cloud shade, fire light
 // where a seed stalk's rows sit: most of them in the head
 float stalkRow(float t) {
   float k = t * (uRows - 1.0);
+  float res = t;
   if (uRows > 6.5) {
     float r[8] = float[8](0.0, 0.3, 0.55, 0.74, 0.8, 0.87, 0.94, 1.0);
-    return r[int(k + 0.5)];
-  }
-  if (uRows > 3.5) {
+    res = r[clamp(int(k + 0.5), 0, 7)];
+  } else if (uRows > 3.5) {
     float r[4] = float[4](0.0, 0.76, 0.88, 1.0);
-    return r[int(k + 0.5)];
+    res = r[clamp(int(k + 0.5), 0, 3)];
   }
-  return t;
+  return res;
 }
 
 void main() {
@@ -59,10 +59,20 @@ void main() {
   float dist = distance(xz, uCamPos.xz);
   float keep = (uFade.y < 0.0 ? 1.0 : smoothstep(uFade.x, uFade.y, dist)) * (1.0 - smoothstep(uFade.z, uFade.w, dist));
   float live = smoothstep(0.0, 0.18, keep - q.x * 0.82);
+  if (live <= 0.0) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    return;
+  }
   vec4 m = texture(tMap, extentUv(xz));
   float growth = m.g;
   live *= smoothstep(0.0, 0.22, growth - q.y * 0.78);
   if (live <= 0.0) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    return;
+  }
+  float gy = groundAt(xz);
+  vec4 clip = projectionMatrix * viewMatrix * vec4(xz.x, gy + uHeight * 0.5, xz.y, 1.0);
+  if (clip.w < -2.5 || (clip.w > 0.0 && (abs(clip.x) > clip.w + 2.5 || clip.y < -clip.w - 3.5 || clip.y > clip.w + 3.5))) {
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
     return;
   }
@@ -91,7 +101,6 @@ void main() {
   h *= 1.0 + 0.3 * uTops;
   h *= 1.0 - 0.8 * charred;
 
-  float gy = groundAt(xz);
   vec3 base = vec3(xz.x, gy, xz.y);
 
   // which way it leans, and how far, as an angle from upright
@@ -102,13 +111,15 @@ void main() {
   float flutter = sin(r.w * 40.0 + uTime * (5.0 + 4.0 * r.z)) * (0.028 + 0.013 * U);
   L += uWind.xy * (U * mix(0.028, 0.105, gust) + flutter * 0.6) + vec2(-uWind.y, uWind.x) * flutter * 0.5;
   L += vec2(sin(uTime * 0.7 + r.x * 30.0), cos(uTime * 0.6 + r.y * 30.0)) * 0.03;
-  for (int i = 0; i < 6; i++) {
-    vec4 p = uPushers[i];
-    if (p.w <= 0.0) continue;
-    vec2 d = xz - p.xz;
-    float dd = length(d);
-    float k = (1.0 - smoothstep(p.w * 0.7, p.w * 1.9, dd)) * (1.0 - smoothstep(gy + h * 0.5, gy + h + 0.12, p.y - p.w));
-    L += d / max(dd, 1e-3) * k * 0.95;
+  if (uFade.z < 20.0) {
+    for (int i = 0; i < 6; i++) {
+      vec4 p = uPushers[i];
+      if (p.w <= 0.0) continue;
+      vec2 d = xz - p.xz;
+      float dd = length(d);
+      float k = (1.0 - smoothstep(p.w * 0.7, p.w * 1.9, dd)) * (1.0 - smoothstep(gy + h * 0.5, gy + h + 0.12, p.y - p.w));
+      L += d / max(dd, 1e-3) * k * 0.95;
+    }
   }
   L = L * (1.0 - 0.8 * flat_) + bend * 1.42;
   L *= 1.0 + 0.9 * charred;
@@ -155,11 +166,6 @@ void main() {
   // a tuft stands for many blades, and of those you mostly see the tops
   float sc = mix(s, 1.0, uTops);
   up = max(up, uTops * 1.2);
-  vec3 col = grassColor(dry * (1.0 - 0.5 * m.b), sc);
-  col *= mix(0.88, 1.14, cl.a) * mix(0.94, 1.06, q.z) * (1.0 + 0.3 * gust * min(U / 6.0, 1.0));
-  // some clumps are yellower, some bluer: more than one kind of grass grows here
-  col *= mix(vec3(1.08, 1.0, 0.82), vec3(0.9, 1.0, 1.08), cl.g);
-  col *= meadowTint(xz);
   // each blade is a stroke of the brush and takes the tone of the dab it stands in: light dabs yellower, dark bluer
   float dab = (textureLod(tStrokes, xz / 6.0, 0.0).r - 0.5) * 0.5 + patchT;
   // only some blades are drawn: one in a dozen is a darker stroke, one in fifteen catches the light
@@ -169,7 +175,7 @@ void main() {
   tone += (rel - 0.5) * 0.6;
   // the grass nearest you is the picture's foreground, and a tone deeper
   tone -= 0.2 * (1.0 - smoothstep(1.5, 9.0, dist));
-  col = meadowGreen(tone) * mix(vec3(1.0), meadowTint(xz), 0.5);
+  vec3 col = meadowGreen(tone) * mix(vec3(1.0), meadowTint(xz), 0.5);
   col = mix(col, vec3(0.44, 0.47, 0.17), dry * 0.45);
   if (stalk) col = mix(col, mix(vec3(0.46, 0.52, 0.18), vec3(0.4, 0.46, 0.2), step(0.72, cl.g)), smoothstep(0.75, 0.82, s));
   // far off, a few tufts carry the colour of the flowers among them
@@ -204,7 +210,7 @@ void main() {
   vec3 N = normalize(vNormal);
   if (dot(N, V) < 0.0) N = -N;
   // a blade is folded along its middle, not flat
-  N = normalize(N + normalize(vAcross) * vMisc.x * 0.5);
+  N = normalize(N + vAcross * vMisc.x * 0.5);
   vec3 c = vAlbedo * meadowLight(vLight.x) * mix(0.84, 1.0, vMisc.y) + vAlbedo * uFireColor * vLight.y * 0.5;
   c += fireRamp(0.3 + 0.55 * vMisc.w) * vMisc.w * 1.5;
   outC = vec4(applyFog(c, vWorld), 1.0);
@@ -258,15 +264,31 @@ function ringGeometry(ring, random) {
  * @param o.density 0 to 1, the share of blades drawn
  * @param heightAt the CPU's ground, for placing each tile so it's culled properly
  */
-export function createBlades(shared, { height = 0.52, density = 1, seed = 1 } = {}, heightAt) {
+export function createBlades(shared, { height = 0.52, density = 1, seed = 1, simple = false, rangeScale = 1 } = {}, heightAt) {
   const group = new THREE.Group();
   const random = mulberry(seed * 977 + 3);
-  const rings = RINGS.map((ring, index) => {
+  const lowGeom = simple || density <= 0.55;
+  const initScale = Math.min(1.3, Math.max(0.5, Number(rangeScale) || 1));
+  let lastX = 0;
+  let lastZ = 0;
+  let followed = false;
+  const rings = RINGS.map((baseRing, index) => {
+    const ring = lowGeom
+      ? baseRing.name === 'near'
+        ? { ...baseRing, rows: 4 }
+        : baseRing.name === 'mid'
+          ? { ...baseRing, rows: 2, width: 2.65 }
+          : baseRing.name === 'wide'
+            ? { ...baseRing, width: 6.4 }
+            : { ...baseRing, sub: 1, width: 17.5, fade: [34, 48, 84, 106] }
+      : baseRing;
+    const baseFade = [...ring.fade];
+    const fade = baseFade.map((v) => (v < 0 ? v : v * initScale));
     const { geometry, count } = ringGeometry(ring, random);
     const uniforms = {
       ...shared,
       uCell: { value: ring.cell },
-      uFade: { value: new THREE.Vector4(...ring.fade) },
+      uFade: { value: new THREE.Vector4(...fade) },
       uWidth: { value: ring.width },
       uSalt: { value: index * 101 + seed },
       uRows: { value: ring.rows },
@@ -279,11 +301,11 @@ export function createBlades(shared, { height = 0.52, density = 1, seed = 1 } = 
       for (let i = 0; i < ring.tiles; i++) {
         const mesh = new THREE.Mesh(geometry, material);
         mesh.matrixAutoUpdate = false;
-        tiles.push({ mesh, i: i - ring.tiles / 2, j: j - ring.tiles / 2 });
+        tiles.push({ mesh, i: i - ring.tiles / 2, j: j - ring.tiles / 2, ox: 0, oz: 0 });
         group.add(mesh);
       }
     }
-    return { ring, geometry, material, uniforms, tiles, count, at: [NaN, NaN] };
+    return { ring, baseFade, fade, geometry, material, uniforms, tiles, count, at: [NaN, NaN], vx: NaN, vz: NaN };
   });
 
   return {
@@ -296,19 +318,64 @@ export function createBlades(shared, { height = 0.52, density = 1, seed = 1 } = 
     setHeight(h) {
       for (const r of rings) r.uniforms.uHeight.value = h;
     },
-    /** Keeps each ring's tiles under the camera. Only does anything when the camera crosses into a new tile. */
-    follow(x, z) {
+    /** Scales grass ring fade distances live without rebuilding geometry. */
+    setRangeScale(scale = 1) {
+      const s = Math.min(1.3, Math.max(0.5, Number(scale) || 1));
       for (const r of rings) {
-        const sx = Math.floor(x / r.ring.tile);
-        const sz = Math.floor(z / r.ring.tile);
-        if (sx === r.at[0] && sz === r.at[1]) continue;
-        r.at = [sx, sz];
-        for (const tile of r.tiles) {
-          const ox = (sx + tile.i) * r.ring.tile;
-          const oz = (sz + tile.j) * r.ring.tile;
-          tile.mesh.position.set(ox, heightAt(ox + r.ring.tile / 2, oz + r.ring.tile / 2), oz);
-          tile.mesh.updateMatrix();
-          tile.mesh.updateMatrixWorld(true);
+        for (let i = 0; i < 4; i++) {
+          const base = r.baseFade[i];
+          r.fade[i] = base < 0 ? base : base * s;
+        }
+        r.uniforms.uFade.value.set(r.fade[0], r.fade[1], r.fade[2], r.fade[3]);
+        r.vx = NaN;
+        r.vz = NaN;
+      }
+      if (followed) this.follow(lastX, lastZ);
+    },
+    /** Keeps each ring's tiles under the camera and culls tiles outside the ring's fade annulus. */
+    follow(x, z) {
+      lastX = x;
+      lastZ = z;
+      followed = true;
+      for (const r of rings) {
+        const s = r.ring.tile;
+        const sx = Math.floor(x / s);
+        const sz = Math.floor(z / s);
+        const movedTile = sx !== r.at[0] || sz !== r.at[1];
+        if (movedTile) {
+          r.at = [sx, sz];
+          for (const tile of r.tiles) {
+            const ox = (sx + tile.i) * s;
+            const oz = (sz + tile.j) * s;
+            tile.ox = ox;
+            tile.oz = oz;
+            tile.mesh.position.set(ox, heightAt(ox + s / 2, oz + s / 2), oz);
+            tile.mesh.updateMatrix();
+            tile.mesh.updateMatrixWorld(true);
+          }
+        }
+        if (movedTile || Math.hypot(x - r.vx, z - r.vz) >= 1.5) {
+          r.vx = x;
+          r.vz = z;
+          const fade = r.fade;
+          const pad = 1.6 + r.ring.cell;
+          const maxR = fade[3] + pad;
+          const minR = fade[1] < 0 ? -1 : fade[0] - pad;
+          for (const tile of r.tiles) {
+            const minDx = Math.max(0, tile.ox - x, x - (tile.ox + s));
+            const minDz = Math.max(0, tile.oz - z, z - (tile.oz + s));
+            if (minDx * minDx + minDz * minDz > maxR * maxR) {
+              tile.mesh.visible = false;
+              continue;
+            }
+            if (minR > 0) {
+              const maxDx = Math.max(Math.abs(tile.ox - x), Math.abs(tile.ox + s - x));
+              const maxDz = Math.max(Math.abs(tile.oz - z), Math.abs(tile.oz + s - z));
+              tile.mesh.visible = maxDx * maxDx + maxDz * maxDz >= minR * minR;
+            } else {
+              tile.mesh.visible = true;
+            }
+          }
         }
       }
     },

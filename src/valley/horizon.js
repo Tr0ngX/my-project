@@ -10,11 +10,16 @@ import { fieldsAt, forestAt, heightAt, HERO } from './world.js';
 export const REACH = 6200;
 
 const vertex = /* glsl */ `
+${COMMON}
 out vec3 vWorld;
 out vec3 vNormal;
+out float vCloud;
 void main() {
   vWorld = position;
   vNormal = normal;
+  vec2 cp = (position.xz - uWindScroll * 2.6) / 3400.0;
+  float cc = textureLod(tNoiseHi, cp, 0.0).b * 0.7 + textureLod(tNoiseHi, cp * 2.7 + 0.19, 0.0).a * 0.3;
+  vCloud = 1.0 - uCloudShade * smoothstep(0.47, 0.6, cc);
   gl_Position = projectionMatrix * viewMatrix * vec4(position, 1.0);
 }
 `;
@@ -25,6 +30,7 @@ ${LEAF_LIGHT}
 layout(location = 0) out vec4 outC;
 in vec3 vWorld;
 in vec3 vNormal;
+in float vCloud;
 uniform sampler2D tFar;     // forest, fields, over the square the plain covers
 uniform float uFarInv;      // 1 / that square's side
 uniform vec2 uAlong;        // the way the valley runs
@@ -40,57 +46,57 @@ void main() {
   vec2 xz = vWorld.xz;
   float dist = distance(vWorld, uCamPos);
   vec3 V = normalize(uCamPos - vWorld);
-  float cloud = cloudAt(xz);
+  float cloud = vCloud;
   float rel = slopeRel(N);
   float sunny = cloud * slopeSun(rel);
 
-  // near: the meadow, exactly as the field's own ground paints it far off
-  // the farmland, as it is painted (floor.js): fields, hedges, the road
+  float farMix = smoothstep(650.0, 1400.0, dist);
+  vec4 a = farMix > 0.0 ? texture(tNoiseHi, xz / 2300.0) : vec4(0.5);
   vec4 fl = floorAt(xz);
-  float sx = strokeCoord(vWorld);
-  float sw = fwidth(sx);
-  float sy = strokeCoord2(xz);
-  float syw = fwidth(sy);
-  vec2 hq = heroAngle(vWorld);
-  vec2 hw = fwidth(hq);
-  vec3 g = paintGround(mix(meadowGreen(0.6 + (rel - 0.5) * 0.4), fl.rgb, fl.a), xz, dist, 0.0);
-  g = heroPaint(landStrokes(landStrokes(g, xz, dist, sx, sw), xz, dist, sy, syw), vWorld, hq, hw, dist);
-  vec3 near = g * meadowLight(sunny);
 
-  vec4 a = texture(tNoiseHi, xz / 2300.0);
-  vec4 b = texture(tNoiseHi, xz / 810.0 + 0.31);
-  vec4 c = texture(tNoiseHi, xz / 230.0 + 0.57);
-  vec4 e = texture(tNoiseHi, xz / 47.0 + 0.13);
-  vec4 far4 = texture(tFar, xz * uFarInv + 0.5);
+  // blend near and far base grass before running the shared brush passes once instead of twice
+  float gIdx = mix(0.6, 0.5 + 0.2 * smoothstep(0.3, 0.7, a.g), farMix) + (rel - 0.5) * 0.4;
+  vec3 col = paintGround(mix(meadowGreen(gIdx), fl.rgb, fl.a), xz, dist, 0.0);
+  if (dist < 4620.0) {
+    float sx = strokeCoord(vWorld);
+    col = landStrokes(col, xz, dist, sx, fwidth(sx));
+    float sy = strokeCoord2(xz);
+    col = landStrokes(col, xz, dist, sy, fwidth(sy));
+  }
+  if (distance(xz, uHeroEye.xz) < 3620.0) {
+    vec2 hq = heroAngle(vWorld);
+    col = heroPaint(col, vWorld, hq, fwidth(hq), dist);
+  }
 
-  // meadow: the same greens in broad soft patches, yellower on the rises, with a brush's streaks in it
-  vec3 col = meadowGreen(0.5 + 0.2 * smoothstep(0.3, 0.7, a.g) + (rel - 0.5) * 0.4);
+  vec3 near = farMix < 1.0 ? col * meadowLight(sunny) : vec3(0.0);
+  vec3 far = near;
+  if (farMix > 0.0) {
+    vec4 b = texture(tNoiseHi, xz / 810.0 + 0.31);
+    vec4 c = texture(tNoiseHi, xz / 230.0 + 0.57);
+    vec4 e = texture(tNoiseHi, xz / 47.0 + 0.13);
+    vec4 far4 = texture(tFar, xz * uFarInv + 0.5);
 
-  col = paintGround(mix(col, fl.rgb, fl.a), xz, dist, 0.0);
-  col = heroPaint(landStrokes(landStrokes(col, xz, dist, sx, sw), xz, dist, sy, syw), vWorld, hq, hw, dist);
+    // forest floor: dark under the trees that stand on it, its edge ragged
+    float forest = smoothstep(0.38, 0.62, far4.r + (c.r - 0.5) * 0.34 + (e.g - 0.5) * 0.2);
+    vec3 fcol = mix(col, mix(vec3(0.03, 0.14, 0.07), vec3(0.06, 0.2, 0.08), e.b), forest);
+    // (green land seen from far off is lit a little from every side)
+    far = fcol * meadowLight(sunny);
 
-  // forest floor: dark under the trees that stand on it, its edge ragged
-  float forest = smoothstep(0.38, 0.62, far4.r + (c.r - 0.5) * 0.34 + (e.g - 0.5) * 0.2);
-  col = mix(col, mix(vec3(0.03, 0.14, 0.07), vec3(0.06, 0.2, 0.08), e.b), forest);
+    // the river: it holds the pale sky low down, and the sun where the sun is
+    float u = dot(xz, uAlong);
+    float v = dot(xz, vec2(-uAlong.y, uAlong.x));
+    float slope = (330.0 / 520.0) * cos(u / 520.0 + 0.6) + (80.0 / 170.0) * cos(u / 170.0 + 2.0) - (u > -400.0 ? (900.0 / 350.0) * exp(-u / 350.0) : 0.0);
+    float rd = abs(v - riverLine(u)) / sqrt(1.0 + slope * slope);
+    float width = 15.0 + 8.0 * b.g + max(u, 0.0) * 0.0045;
+    float water = (1.0 - smoothstep(width - 2.5, width + 1.5, rd + (e.a - 0.5) * 5.0)) * (1.0 - smoothstep(-2.0, 6.0, vWorld.y + u * 0.0035));
+    // (a pale shingle bank on the inside of its bends)
+    far = mix(far, vec3(0.62, 0.6, 0.48) * (uSunColor * 0.35 * cloud + uSkyColor * 0.5), (1.0 - smoothstep(width + 2.0, width + 9.0, rd)) * step(0.55, b.r) * 0.8);
+    vec3 R = reflect(-V, vec3(0.0, 1.0, 0.0));
+    vec3 mirror = mix(uFogColor * 1.08, uSkyColor * 1.45, smoothstep(0.0, 0.5, R.y)) + uSunColor * pow(max(dot(R, uSunDir), 0.0), 90.0) * 0.5;
+    far = mix(far, mirror, water);
+  }
 
-  float sun = max(dot(N, uSunDir), 0.0);
-  // (green land seen from far off is lit a little from every side)
-  vec3 far = col * meadowLight(sunny);
-
-  // the river: it holds the pale sky low down, and the sun where the sun is
-  float u = dot(xz, uAlong);
-  float v = dot(xz, vec2(-uAlong.y, uAlong.x));
-  float slope = (330.0 / 520.0) * cos(u / 520.0 + 0.6) + (80.0 / 170.0) * cos(u / 170.0 + 2.0) - (u > -400.0 ? (900.0 / 350.0) * exp(-u / 350.0) : 0.0);
-  float rd = abs(v - riverLine(u)) / sqrt(1.0 + slope * slope);
-  float width = 15.0 + 8.0 * b.g + max(u, 0.0) * 0.0045;
-  float water = (1.0 - smoothstep(width - 2.5, width + 1.5, rd + (e.a - 0.5) * 5.0)) * (1.0 - smoothstep(-2.0, 6.0, vWorld.y + u * 0.0035));
-  // (a pale shingle bank on the inside of its bends)
-  far = mix(far, vec3(0.62, 0.6, 0.48) * (uSunColor * 0.35 * cloud + uSkyColor * 0.5), (1.0 - smoothstep(width + 2.0, width + 9.0, rd)) * step(0.55, b.r) * 0.8);
-  vec3 R = reflect(-V, vec3(0.0, 1.0, 0.0));
-  vec3 mirror = mix(uFogColor * 1.08, uSkyColor * 1.45, smoothstep(0.0, 0.5, R.y)) + uSunColor * pow(max(dot(R, uSunDir), 0.0), 90.0) * 0.5;
-  far = mix(far, mirror, water);
-
-  vec3 outCol = mix(near, far, smoothstep(650.0, 1400.0, dist));
+  vec3 outCol = mix(near, far, farMix);
   outC = vec4(applyFog(outCol, vWorld), mix(1.0, 0.4, smoothstep(520.0, 700.0, dist)));
 }
 `;
@@ -116,9 +122,10 @@ function farMap(size = 1024) {
 }
 
 /** @param inner half the side of the square the field's ground covers; the land starts just inside it */
-export function createHorizon(field, inner = 512) {
-  const around = 1440;
-  const rings = 120;
+export function createHorizon(field, inner = 512, { simple = false } = {}) {
+  const sectors = 8;
+  const around = simple ? 360 : 720;
+  const rings = simple ? 40 : 64;
   const edge = inner - 6;
   const reach = REACH / edge;
   const positions = new Float32Array(around * (rings + 1) * 3);
@@ -152,21 +159,79 @@ export function createHorizon(field, inner = 512) {
       const a = k * around + i;
       const b = k * around + ((i + 1) % around);
       indices[q++] = a;
-      indices[q++] = a + around;
-      indices[q++] = b;
       indices[q++] = b;
       indices[q++] = a + around;
+      indices[q++] = b;
       indices[q++] = b + around;
+      indices[q++] = a + around;
     }
   }
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  geometry.setIndex(new THREE.BufferAttribute(indices, 1));
-  geometry.computeVertexNormals();
-  const far = farMap();
+  const posAttr = new THREE.BufferAttribute(positions, 3);
+  const fullGeom = new THREE.BufferGeometry();
+  fullGeom.setAttribute('position', posAttr);
+  fullGeom.setIndex(new THREE.BufferAttribute(indices, 1));
+  fullGeom.computeVertexNormals();
+  const norAttr = fullGeom.getAttribute('normal');
+
+  const far = farMap(simple ? 512 : 1024);
   const uniforms = { ...field.uniforms, tFar: { value: far }, uFarInv: { value: 1 / (REACH * 2) }, uAlong: { value: new THREE.Vector2(HERO[0], HERO[1]) } };
-  const material = new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, vertexShader: vertex, fragmentShader: fragment, uniforms, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 12 });
-  const mesh = new THREE.Mesh(geometry, material);
-  mesh.frustumCulled = false;
-  return mesh;
+  const material = new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, vertexShader: vertex, fragmentShader: fragment, uniforms, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 12 });
+
+  // Split the ring into angular sectors so hardware frustum culling skips wedges behind the camera.
+  const group = new THREE.Group();
+  group.renderOrder = 2;
+  const colsPerSector = around / sectors;
+  for (let s = 0; s < sectors; s++) {
+    const i0 = s * colsPerSector;
+    const i1 = i0 + colsPerSector;
+    const sIdx = new Uint32Array(rings * colsPerSector * 6);
+    let sq = 0;
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (let k = 0; k <= rings; k++) {
+      for (let c = i0; c <= i1; c++) {
+        const vi = (k * around + (c % around)) * 3;
+        const x = positions[vi], y = positions[vi + 1], z = positions[vi + 2];
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        if (z < minZ) minZ = z;
+        if (z > maxZ) maxZ = z;
+      }
+    }
+    for (let k = 0; k < rings; k++) {
+      for (let i = i0; i < i1; i++) {
+        const a = k * around + i;
+        const b = k * around + ((i + 1) % around);
+        sIdx[sq++] = a;
+        sIdx[sq++] = b;
+        sIdx[sq++] = a + around;
+        sIdx[sq++] = b;
+        sIdx[sq++] = b + around;
+        sIdx[sq++] = a + around;
+      }
+    }
+    const sg = new THREE.BufferGeometry();
+    sg.setAttribute('position', posAttr);
+    sg.setAttribute('normal', norAttr);
+    sg.setIndex(new THREE.BufferAttribute(sIdx, 1));
+    const mesh = new THREE.Mesh(sg, material);
+    mesh.boundingSphere = new THREE.Sphere(
+      new THREE.Vector3((minX + maxX) * 0.5, (minY + maxY) * 0.5, (minZ + maxZ) * 0.5),
+      Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) * 0.5,
+    );
+    mesh.renderOrder = 2;
+    group.add(mesh);
+  }
+  let horizonRange = REACH;
+  group.group = group;
+  group.setViewDistance = (meters) => {
+    horizonRange = Math.max(800, Number(meters) || REACH);
+    return group;
+  };
+  group.setFogDistance = (meters) => group.setViewDistance(meters);
+  group.update = () => {};
+  group.stats = () => ({ totalChunks: sectors, builtChunks: sectors, visibleChunks: sectors, viewDistance: horizonRange });
+  return group;
 }

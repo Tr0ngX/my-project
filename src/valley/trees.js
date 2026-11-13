@@ -100,7 +100,7 @@ function growTree(seed, o) {
       const d2 = new V3(Math.cos(a2) * Math.cos(e2), Math.sin(e2), Math.sin(a2) * Math.cos(e2));
       const end2 = from.clone().addScaledVector(d2, l2);
       const mid2 = from.clone().addScaledVector(d2, l2 * 0.5).add(new V3((random() - 0.5) * l2 * 0.2, l2 * 0.06, (random() - 0.5) * l2 * 0.2));
-      tubes.push({ pts: [from, mid2, end2], r0: o.girth * 0.13, r1: o.girth * 0.035, sides: 6 });
+      if (!o.noTwigs) tubes.push({ pts: [from, mid2, end2], r0: o.girth * 0.13, r1: o.girth * 0.035, sides: 6 });
       clumps.push({ c: end2, r: o.clump * (0.75 + 0.45 * random()) });
     }
   }
@@ -120,7 +120,8 @@ function growTree(seed, o) {
   const idx = [];
   for (const tube of tubes) {
     const curve = tube.curve ?? new THREE.CatmullRomCurve3(tube.pts);
-    const rows = tube.root ? 14 : 10;
+    const rows = o.simple ? (tube.root ? 6 : 3) : (tube.root ? 14 : 10);
+    const sides = o.simple ? Math.max(4, Math.ceil(tube.sides * 0.5)) : tube.sides;
     const frames = curve.computeFrenetFrames(rows, false);
     const first = pos.length / 3;
     const phase = random() * TAU;
@@ -128,21 +129,21 @@ function growTree(seed, o) {
     for (let j = 0; j <= rows; j++) {
       const t = j / rows;
       const p = curve.getPoint(t);
-      for (let i = 0; i <= tube.sides; i++) {
-        const a = (i / tube.sides) * TAU;
+      for (let i = 0; i <= sides; i++) {
+        const a = (i / sides) * TAU;
         let r = tube.r0 + (tube.r1 - tube.r0) * t;
         // a bole spreads into its roots, and is never round
         if (tube.root) r *= 1 + 1.15 * Math.exp(-t * 7.5) * (0.62 + 0.38 * Math.sin(a * 5 + phase) * Math.sin(a * 2 + 1)) + 0.07 * Math.sin(a * 3 + t * 6 + phase);
         const n = frames.normals[j].clone().multiplyScalar(Math.cos(a)).addScaledVector(frames.binormals[j], Math.sin(a));
         pos.push(p.x + n.x * r, p.y + n.y * r, p.z + n.z * r);
         nor.push(n.x, n.y, n.z);
-        bark.push(i / tube.sides, t * along);
+        bark.push(i / sides, t * along);
       }
     }
     for (let j = 0; j < rows; j++) {
-      for (let i = 0; i < tube.sides; i++) {
-        const a = first + j * (tube.sides + 1) + i;
-        const b = a + tube.sides + 1;
+      for (let i = 0; i < sides; i++) {
+        const a = first + j * (sides + 1) + i;
+        const b = a + sides + 1;
         idx.push(a, b, a + 1, a + 1, b, b + 1);
       }
     }
@@ -162,7 +163,7 @@ function growTree(seed, o) {
   const cp = [];
   const cball = [];
   const crand = [];
-  const ico = new THREE.IcosahedronGeometry(1, 1).attributes.position;
+  const ico = new THREE.IcosahedronGeometry(1, o.coreDetail ?? 0).attributes.position;
   const centre = new V3(0, crownY, 0);
   const x = new V3();
   const y = new V3();
@@ -235,6 +236,7 @@ out vec2 vUv;
 out vec3 vWorld;
 out vec3 vBall;
 out vec3 vRand;
+out float vCloud;
 void main() {
   mat4 m = modelMatrix * instanceMatrix;
   vec4 w = m * vec4(position, 1.0);
@@ -246,6 +248,11 @@ void main() {
   float sway = sin(uTime * (0.9 + 0.5 * aRand.y) + aRand.y * 37.0);
   w.xz += uWind.xy * (U * (0.012 + 0.05 * gust) + sway * 0.012 * U) * high;
   w.xyz += vBall * sin(uTime * (2.6 + 2.0 * aRand.x) + aRand.x * 61.0) * 0.006 * U * (0.4 + gust);
+  // Cumulus shadow at 3400m scale varies smoothly over hundreds of metres: compute once per vertex.
+  vec2 cp = (w.xz + uSunDir.xz * 30.0 - uWindScroll * 2.6) / 3400.0;
+  float cc = textureLod(tNoiseHi, cp, 0.0).b * 0.7 + textureLod(tNoiseHi, cp * 2.7 + 0.19, 0.0).a * 0.3;
+  float cOpen = 1.0 - uCloudShade * smoothstep(0.47, 0.6, cc);
+  vCloud = mix(0.45, 1.0, clamp((cOpen - 0.5) * 2.0, 0.0, 1.0));
   vWorld = w.xyz;
   vUv = uv;
   vRand = aRand.xyz;
@@ -257,18 +264,25 @@ const leafFragment = /* glsl */ `
 ${COMMON}
 layout(location = 0) out vec4 outC;
 uniform sampler2D tLeaf;
+uniform float uCutout;
 in vec2 vUv;
 in vec3 vWorld;
 in vec3 vBall;
 in vec3 vRand;
+in float vCloud;
 void main() {
   float dist = distance(vWorld, uCamPos);
   vec4 leaf = texture(tLeaf, vUv);
   float a = leaf.g;
   // far off the sprays thin to nothing as their picture blurs: keep the crown whole
   float cut = mix(0.5, 0.16, smoothstep(20.0, 100.0, dist));
-  a = clamp((a - cut) / max(fwidth(a), 1e-4) + 0.5, 0.0, 1.0);
-  if (a < 0.04) discard;
+  if (uCutout > 0.5) {
+    if (a < cut - 0.01) discard;
+    a = 1.0;
+  } else {
+    a = clamp((a - cut) / max(fwidth(a), 1e-4) + 0.5, 0.0, 1.0);
+    if (a < 0.04) discard;
+  }
   vec3 N = normalize(vBall);
   vec3 V = normalize(uCamPos - vWorld);
   // each clump is lit as a ball; each spray is a shade of its own, as brush marks are
@@ -279,8 +293,7 @@ void main() {
   vec3 col = mix(vec3(0.014, 0.1, 0.1), vec3(0.035, 0.2, 0.12), smoothstep(0.3, 0.42, tone));
   col = mix(col, vec3(0.1, 0.36, 0.12), smoothstep(0.56, 0.68, tone));
   col = mix(col, vec3(0.3, 0.56, 0.15), smoothstep(0.84, 0.92, tone));
-  float cloud = cloudAt(vWorld.xz + uSunDir.xz * 30.0);
-  vec3 light = uSkyColor * 0.9 + uSunColor * (0.2 + 0.16 * smoothstep(0.5, 0.9, tone)) * mix(0.45, 1.0, clamp((cloud - 0.5) * 2.0, 0.0, 1.0));
+  vec3 light = uSkyColor * 0.9 + uSunColor * (0.2 + 0.16 * smoothstep(0.5, 0.9, tone)) * vCloud;
   // seen against the sun, leaves glow
   float through = pow(max(dot(-V, uSunDir), 0.0), 2.0);
   col = col * light + vec3(0.3, 0.5, 0.05) * uSunColor * through * (0.05 + 0.24 * vRand.x * vRand.x);
@@ -295,13 +308,18 @@ in vec2 vUv;
 in vec3 vWorld;
 in vec3 vBall;
 in vec3 vRand;
+in float vCloud;
 uniform sampler2D tLeaf;
+uniform float uCoreCut;
 void main() {
   vec3 N = normalize(vBall);
-  // not a solid: a shell of leaves, cut from the same sprays, that you see into
-  vec3 w = abs(N);
-  vec2 uv = w.y > max(w.x, w.z) ? N.xz : w.x > w.z ? N.zy : N.xy;
-  if (texture(tLeaf, uv * 2.3 + vRand.y * 7.0).g < 0.4) discard;
+  // not a solid: a shell of leaves, cut from the same sprays, that you see into close up
+  float dist = distance(vWorld, uCamPos);
+  if (dist < uCoreCut) {
+    vec3 w = abs(N);
+    vec2 uv = w.y > max(w.x, w.z) ? N.xz : w.x > w.z ? N.zy : N.xy;
+    if (texture(tLeaf, uv * 2.3 + vRand.y * 7.0).g < 0.4) discard;
+  }
   if (!gl_FrontFacing) N = -N;
   float n = texture(tNoise, vWorld.xz * 0.9 + vWorld.y * 0.37).r;
   // lit as the sprays on it are, a tone deeper: it is the inside of the crown
@@ -309,8 +327,28 @@ void main() {
   tone = tone * mix(0.5, 1.0, vRand.z) + (n - 0.5) * 0.36 - 0.04;
   vec3 col = mix(vec3(0.014, 0.1, 0.1), vec3(0.035, 0.19, 0.115), smoothstep(0.3, 0.42, tone));
   col = mix(col, vec3(0.09, 0.33, 0.11), smoothstep(0.58, 0.7, tone));
-  float cloud = cloudAt(vWorld.xz + uSunDir.xz * 30.0);
-  col *= uSkyColor * 0.9 + uSunColor * (0.2 + 0.14 * smoothstep(0.5, 0.9, tone)) * mix(0.45, 1.0, clamp((cloud - 0.5) * 2.0, 0.0, 1.0));
+  col *= uSkyColor * 0.9 + uSunColor * (0.2 + 0.14 * smoothstep(0.5, 0.9, tone)) * vCloud;
+  outC = vec4(applyFog(col, vWorld), 1.0);
+}
+`;
+
+// Opaque front-side core for distant woods (>640m) keeps hardware Early-Z active and halves tris.
+const coreOpaqueFragment = /* glsl */ `
+${COMMON}
+layout(location = 0) out vec4 outC;
+in vec2 vUv;
+in vec3 vWorld;
+in vec3 vBall;
+in vec3 vRand;
+in float vCloud;
+void main() {
+  vec3 N = normalize(vBall);
+  float n = texture(tNoise, vWorld.xz * 0.9 + vWorld.y * 0.37).r;
+  float tone = dot(N, uSunDir) * 0.5 + 0.5;
+  tone = tone * mix(0.5, 1.0, vRand.z) + (n - 0.5) * 0.36 - 0.04;
+  vec3 col = mix(vec3(0.014, 0.1, 0.1), vec3(0.035, 0.19, 0.115), smoothstep(0.3, 0.42, tone));
+  col = mix(col, vec3(0.09, 0.33, 0.11), smoothstep(0.58, 0.7, tone));
+  col *= uSkyColor * 0.9 + uSunColor * (0.2 + 0.14 * smoothstep(0.5, 0.9, tone)) * vCloud;
   outC = vec4(applyFog(col, vWorld), 1.0);
 }
 `;
@@ -419,20 +457,29 @@ function plant() {
   return trees;
 }
 
-/** @param options.cards 0 to 1, the share of leaf sprays drawn */
-export function createTrees(field, { cards = 1 } = {}) {
+/**
+ * @param options.cards 0 to 1, the share of leaf sprays drawn
+ * @param options.start initial [x, z] camera focus for eager nearby chunks
+ * @param options.viewDistance active chunk visibility radius in metres
+ * @param options.initialRadius synchronous boot build radius in metres (defaults to min(viewDistance, 240))
+ */
+export function createTrees(
+  field,
+  { cards = 1, cutout = false, simple = false, start = [0, 0], viewDistance = 520, initialRadius = Math.min(viewDistance, 240) } = {},
+) {
+  const simpleWood = simple || cards <= 0.65;
   const kinds = [
-    growTree(11, { trunk: 3.6, girth: 0.92, crown: 11.5, rise: 12.5, limbs: 6, clump: 2.7, fill: 26, cards: Math.round(92 * cards), spray: 1.05 }),
-    growTree(23, { trunk: 2.6, girth: 0.42, crown: 5.6, rise: 8.2, limbs: 4, clump: 1.9, fill: 9, cards: Math.round(48 * cards), spray: 1.15 }),
-    growTree(37, { trunk: 3.3, girth: 0.36, crown: 4.6, rise: 9.6, limbs: 4, clump: 1.7, fill: 10, cards: Math.round(48 * cards), spray: 1.1 }),
-    growTree(51, { trunk: 2.2, girth: 0.5, crown: 6.6, rise: 7.2, limbs: 5, clump: 2.1, fill: 8, cards: Math.round(48 * cards), spray: 1.15 }),
+    growTree(11, { trunk: 3.6, girth: 0.92, crown: 11.5, rise: 12.5, limbs: 6, clump: 2.7, fill: 26, cards: Math.round(56 * cards), spray: 1.2, coreDetail: 1 }),
+    growTree(23, { trunk: 2.6, girth: 0.42, crown: 5.6, rise: 8.2, limbs: 4, clump: 1.9, fill: 9, cards: Math.round(24 * cards), spray: 1.38, simple: simpleWood }),
+    growTree(37, { trunk: 3.3, girth: 0.36, crown: 4.6, rise: 9.6, limbs: 4, clump: 1.7, fill: 10, cards: Math.round(24 * cards), spray: 1.34, simple: simpleWood }),
+    growTree(51, { trunk: 2.2, girth: 0.5, crown: 6.6, rise: 7.2, limbs: 5, clump: 2.1, fill: 8, cards: Math.round(24 * cards), spray: 1.38, simple: simpleWood }),
   ];
   const trees = plant();
-  // past the walk: the same trees, drawn with a third of the sprays, each bigger
+  // past the walk: the same trees, drawn with fewer, larger sprays and simpler cores/wood
   for (let k = 1; k <= 3; k++) {
     const seed = [0, 23, 37, 51][k];
     const o = [null, { trunk: 2.6, girth: 0.42, crown: 5.6, rise: 8.2, limbs: 4, clump: 1.9, fill: 9 }, { trunk: 3.3, girth: 0.36, crown: 4.6, rise: 9.6, limbs: 4, clump: 1.7, fill: 10 }, { trunk: 2.2, girth: 0.5, crown: 6.6, rise: 7.2, limbs: 5, clump: 2.1, fill: 8 }][k];
-    kinds.push(growTree(seed, { ...o, cards: 22, spray: 1.85 }));
+    kinds.push(growTree(seed, { ...o, cards: 8, spray: 2.65, simple: true, noTwigs: true }));
   }
   {
     const random = mulberry(808);
@@ -458,8 +505,8 @@ export function createTrees(field, { cards = 1 } = {}) {
   // bushes: the same leaves in low mounds, among the stones, beside the path and round the tarn
   const BUSH = kinds.length;
   kinds.push(
-    growTree(71, { trunk: 0.25, girth: 0.07, crown: 1.5, rise: 1.9, limbs: 3, clump: 0.8, fill: 7, cards: Math.round(30 * cards), spray: 0.62 }),
-    growTree(83, { trunk: 0.2, girth: 0.06, crown: 2.1, rise: 1.5, limbs: 4, clump: 0.85, fill: 8, cards: Math.round(30 * cards), spray: 0.62 }),
+    growTree(71, { trunk: 0.25, girth: 0.07, crown: 1.5, rise: 1.9, limbs: 3, clump: 0.8, fill: 7, cards: Math.round(12 * cards), spray: 0.8, simple: true }),
+    growTree(83, { trunk: 0.2, girth: 0.06, crown: 2.1, rise: 1.5, limbs: 4, clump: 0.85, fill: 8, cards: Math.round(12 * cards), spray: 0.8, simple: true }),
   );
   {
     const random = mulberry(313);
@@ -541,31 +588,151 @@ export function createTrees(field, { cards = 1 } = {}) {
     glslVersion: THREE.GLSL3,
     vertexShader: leafVertex,
     fragmentShader: leafFragment,
-    uniforms: { ...field.uniforms, tLeaf: { value: leafTexture() } },
+    uniforms: { ...field.uniforms, tLeaf: { value: leafTexture() }, uCutout: { value: cutout ? 1 : 0 } },
     side: THREE.DoubleSide,
-    alphaToCoverage: true,
+    alphaToCoverage: !cutout,
   });
   const woodMaterial = new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, vertexShader: woodVertex, fragmentShader: woodFragment, uniforms: field.uniforms });
-  const coreMaterial = new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, vertexShader: leafVertex, fragmentShader: coreFragment, uniforms: { ...field.uniforms, tLeaf: leafMaterial.uniforms.tLeaf }, side: THREE.DoubleSide });
+  const coreMaterial = new THREE.ShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    vertexShader: leafVertex,
+    fragmentShader: coreFragment,
+    uniforms: { ...field.uniforms, tLeaf: leafMaterial.uniforms.tLeaf, uCoreCut: { value: simpleWood ? 45.0 : 75.0 } },
+    side: THREE.DoubleSide,
+  });
+  const coreOpaqueMaterial = new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, vertexShader: leafVertex, fragmentShader: coreOpaqueFragment, uniforms: field.uniforms });
   const matrix = new THREE.Matrix4();
   const q = new THREE.Quaternion();
   const up = new V3(0, 1, 0);
+  const posV = new V3();
+  const scaleV = new V3();
+  let currentViewDistance = Math.max(80, Number(viewDistance) || 520);
+  let lastCamX = start[0] ?? 0;
+  let lastCamZ = start[1] ?? 0;
+  let builtCount = 0;
+  let visibleCount = 0;
+  const chunkList = [];
+
   kinds.forEach((kind, k) => {
     const mine = trees.filter((t) => t[2] === k);
     if (!mine.length) return;
-    const leaves = new THREE.InstancedMesh(kind.leaves, leafMaterial, mine.length);
-    const wood = new THREE.InstancedMesh(kind.wood, woodMaterial, mine.length);
-    const core = new THREE.InstancedMesh(kind.core, coreMaterial, mine.length);
-    mine.forEach(([x, z, , scale, turn], i) => {
-      q.setFromAxisAngle(up, turn);
-      matrix.compose(new V3(x, heightAt(x, z), z), q, new V3(scale, scale * (0.94 + 0.12 * ((i * 7) % 5) * 0.25), scale));
-      leaves.setMatrixAt(i, matrix);
-      wood.setMatrixAt(i, matrix);
-      core.setMatrixAt(i, matrix);
-    });
-    leaves.frustumCulled = wood.frustumCulled = core.frustumCulled = false;
-    group.add(wood, core, leaves);
+    // Spatial chunks enable lazy construction + distance streaming + frustum culling across the valley.
+    const cell = k >= 4 && k <= 6 ? 320 : 180;
+    const buckets = new Map();
+    for (const t of mine) {
+      const key = `${Math.floor(t[0] / cell)},${Math.floor(t[1] / cell)}`;
+      let bucket = buckets.get(key);
+      if (!bucket) buckets.set(key, (bucket = []));
+      bucket.push(t);
+    }
+    const drawWood = k < BUSH;
+    const coreMat = k >= 4 && k <= 6 ? coreOpaqueMaterial : coreMaterial;
+    for (const items of buckets.values()) {
+      let minX = Infinity, minY = Infinity, minZ = Infinity;
+      let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+      const entries = [];
+      for (let i = 0; i < items.length; i++) {
+        const [x, z, , scale, turn] = items[i];
+        const y = heightAt(x, z);
+        const sy = scale * (0.94 + 0.12 * ((i * 7) % 5) * 0.25);
+        entries.push([x, y, z, scale, sy, turn]);
+        const hr = (kind.crown + 4) * scale;
+        const htop = (kind.height + 4) * sy;
+        if (x - hr < minX) minX = x - hr;
+        if (x + hr > maxX) maxX = x + hr;
+        if (y - 2 < minY) minY = y - 2;
+        if (y + htop > maxY) maxY = y + htop;
+        if (z - hr < minZ) minZ = z - hr;
+        if (z + hr > maxZ) maxZ = z + hr;
+      }
+      const cx = (minX + maxX) * 0.5;
+      const cy = (minY + maxY) * 0.5;
+      const cz = (minZ + maxZ) * 0.5;
+      const hzRadius = Math.hypot(maxX - minX, maxZ - minZ) * 0.5;
+      const sphere = new THREE.Sphere(new V3(cx, cy, cz), Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) * 0.5);
+      chunkList.push({
+        kind,
+        drawWood,
+        coreMat,
+        entries,
+        cx,
+        cz,
+        hzRadius,
+        sphere,
+        built: false,
+        visible: false,
+        meshes: null,
+      });
+    }
   });
+
+  const buildChunk = (desc) => {
+    if (desc.built) return;
+    const n = desc.entries.length;
+    const leaves = new THREE.InstancedMesh(desc.kind.leaves, leafMaterial, n);
+    const wood = desc.drawWood ? new THREE.InstancedMesh(desc.kind.wood, woodMaterial, n) : null;
+    const core = new THREE.InstancedMesh(desc.kind.core, desc.coreMat, n);
+    for (let i = 0; i < n; i++) {
+      const [x, y, z, scale, sy, turn] = desc.entries[i];
+      q.setFromAxisAngle(up, turn);
+      matrix.compose(posV.set(x, y, z), q, scaleV.set(scale, sy, scale));
+      leaves.setMatrixAt(i, matrix);
+      if (wood) wood.setMatrixAt(i, matrix);
+      core.setMatrixAt(i, matrix);
+    }
+    leaves.boundingSphere = desc.sphere;
+    core.boundingSphere = desc.sphere;
+    if (wood) {
+      wood.boundingSphere = desc.sphere;
+      desc.meshes = [wood, core, leaves];
+      group.add(wood, core, leaves);
+    } else {
+      desc.meshes = [core, leaves];
+      group.add(core, leaves);
+    }
+    desc.entries = null;
+    desc.built = true;
+    builtCount++;
+  };
+
+  const syncChunks = (camX, camZ, { budgetMs = 1.6, force = false, radiusLimit = currentViewDistance, preloadPad = 90 } = {}) => {
+    lastCamX = camX;
+    lastCamZ = camZ;
+    const pending = [];
+    for (let i = 0; i < chunkList.length; i++) {
+      const desc = chunkList[i];
+      const dist = Math.hypot(desc.cx - camX, desc.cz - camZ);
+      const showDist = radiusLimit + desc.hzRadius;
+      if (desc.built) {
+        const wantVis = desc.visible ? dist <= showDist + 16 : dist <= showDist;
+        if (wantVis !== desc.visible) {
+          desc.visible = wantVis;
+          for (const m of desc.meshes) m.visible = wantVis;
+          visibleCount += wantVis ? 1 : -1;
+        }
+      } else if (dist <= showDist + preloadPad) {
+        pending.push({ desc, gap: dist - desc.hzRadius });
+      }
+    }
+    if (!pending.length) return;
+    pending.sort((a, b) => a.gap - b.gap);
+    const t0 = performance.now();
+    const maxBuild = force ? pending.length : 2;
+    let builtNow = 0;
+    for (let i = 0; i < pending.length; i++) {
+      if (!force && builtNow > 0 && (builtNow >= maxBuild || performance.now() - t0 >= budgetMs)) break;
+      const { desc, gap } = pending[i];
+      buildChunk(desc);
+      const vis = gap <= radiusLimit;
+      desc.visible = vis;
+      for (const m of desc.meshes) m.visible = vis;
+      if (vis) visibleCount++;
+      builtNow++;
+    }
+  };
+
+  // Eagerly build only chunks within initialRadius for fast boot; remainder stream via update().
+  syncChunks(lastCamX, lastCamZ, { force: true, radiusLimit: Math.max(80, Number(initialRadius) || 0), preloadPad: 0 });
 
   // ---- their shade on the ground ----
   const RES = 1024;
@@ -580,6 +747,17 @@ export function createTrees(field, { cards = 1 } = {}) {
   return {
     group,
     trees,
+    /** Updates chunk visibility and streams nearby unbuilt chunks within `budgetMs`. */
+    update(camX, camZ, opts) {
+      syncChunks(camX, camZ, opts);
+    },
+    setViewDistance(meters) {
+      currentViewDistance = Math.max(80, Number(meters) || 320);
+      syncChunks(lastCamX, lastCamZ, { budgetMs: 1.8 });
+    },
+    stats() {
+      return { totalChunks: chunkList.length, builtChunks: builtCount, visibleChunks: visibleCount, viewDistance: currentViewDistance };
+    },
     /** Lays every crown's shadow on the ground for this sun. Call when the hour changes. */
     cast(sunDir) {
       data.fill(0);

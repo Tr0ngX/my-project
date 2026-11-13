@@ -29,6 +29,10 @@ void main() {
   vec4 q = cellRand(cell, uSalt + 53.0 + sub * 5.0);
   vec2 xz = (cell + r.xy) * uCell;
   float dist = distance(xz, uCamPos.xz);
+  if (dist > uFade.y) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    return;
+  }
   vec4 m = texture(tMap, extentUv(xz));
   // they grow in drifts
   float drift = smoothstep(0.42, 0.7, texture(tNoise, xz / 23.0).g);
@@ -161,12 +165,12 @@ function flowerGeometry(subs = 2) {
       positions.push(-1, j / 3, z, 1, j / 3, z);
       if (j < 3) indices.push(first + j * 2, first + j * 2 + 1, first + j * 2 + 3, first + j * 2, first + j * 2 + 3, first + j * 2 + 2);
     }
-    // the petals: foot, two shoulders, two further out, the tip
+    // the petals: foot, two shoulders, the tip (diamond quad: 2 tris per petal instead of 4)
     for (let k = 0; k < PETALS; k++) {
       first = positions.length / 3;
       const part = z + 1 + k;
-      positions.push(0, 0, part, -1, 0.4, part, 1, 0.4, part, -1, 0.75, part, 1, 0.75, part, 0, 1, part);
-      indices.push(first, first + 2, first + 1, first + 1, first + 2, first + 4, first + 1, first + 4, first + 3, first + 3, first + 4, first + 5);
+      positions.push(0, 0, part, -1, 0.5, part, 1, 0.5, part, 0, 1, part);
+      indices.push(first, first + 2, first + 1, first + 1, first + 2, first + 3);
     }
     // the middle: a six-sided disc
     first = positions.length / 3;
@@ -207,25 +211,42 @@ export function createFlowers(shared, { height = 0.52, seed = 1 } = {}, heightAt
     for (let i = 0; i < RING.tiles; i++) {
       const mesh = new THREE.Mesh(geometry, material);
       mesh.matrixAutoUpdate = false;
-      tiles.push({ mesh, i: i - RING.tiles / 2, j: j - RING.tiles / 2 });
+      tiles.push({ mesh, i: i - RING.tiles / 2, j: j - RING.tiles / 2, ox: 0, oz: 0 });
       group.add(mesh);
     }
   }
   let at = [NaN, NaN];
+  let vx = NaN, vz = NaN;
   return {
     group,
     uniforms,
     follow(x, z) {
-      const sx = Math.floor(x / RING.tile);
-      const sz = Math.floor(z / RING.tile);
-      if (sx === at[0] && sz === at[1]) return;
-      at = [sx, sz];
-      for (const tile of tiles) {
-        const ox = (sx + tile.i) * RING.tile;
-        const oz = (sz + tile.j) * RING.tile;
-        tile.mesh.position.set(ox, heightAt(ox + RING.tile / 2, oz + RING.tile / 2), oz);
-        tile.mesh.updateMatrix();
-        tile.mesh.updateMatrixWorld(true);
+      const s = RING.tile;
+      const sx = Math.floor(x / s);
+      const sz = Math.floor(z / s);
+      const movedTile = sx !== at[0] || sz !== at[1];
+      if (movedTile) {
+        at = [sx, sz];
+        for (const tile of tiles) {
+          const ox = (sx + tile.i) * s;
+          const oz = (sz + tile.j) * s;
+          tile.ox = ox;
+          tile.oz = oz;
+          tile.mesh.position.set(ox, heightAt(ox + s / 2, oz + s / 2), oz);
+          tile.mesh.updateMatrix();
+          tile.mesh.updateMatrixWorld(true);
+        }
+      }
+      if (movedTile || Math.hypot(x - vx, z - vz) >= 1.5) {
+        vx = x;
+        vz = z;
+        const maxR = RING.fade[1] + 1.6 + RING.cell;
+        const maxR2 = maxR * maxR;
+        for (const tile of tiles) {
+          const minDx = Math.max(0, tile.ox - x, x - (tile.ox + s));
+          const minDz = Math.max(0, tile.oz - z, z - (tile.oz + s));
+          tile.mesh.visible = minDx * minDx + minDz * minDz <= maxR2;
+        }
       }
     },
   };

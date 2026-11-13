@@ -407,18 +407,23 @@ function createParticles(field, uniforms) {
 
 /**
  * @param options.samples MSAA for the scene. options.fireScale the flames' pixels against the screen's.
- * @param options.bloom, options.exposure the finish. Both can be changed later on the frame.
+ * @param options.bloom, options.exposure, options.paint, options.ink, options.distBlur the finish. All can be changed later on the frame.
  */
-export function createFrame(renderer, field, { samples = 4, fireScale = 0.5, bloom = 0.22, exposure = 1, flameHeight = 1.5 } = {}) {
+export function createFrame(
+  renderer,
+  field,
+  { samples = 4, fireScale = 0.5, bloom = 0.22, exposure = 1, flameHeight = 1.5, paint = 0, ink = 1, distBlur = 0.5, near = 0.12, far = 40000, blurStart = 55, blurEnd = 240 } = {},
+) {
   const hdr = { type: THREE.HalfFloatType, format: THREE.RGBAFormat, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false };
   const depth = new THREE.DepthTexture(1, 1, THREE.UnsignedIntType);
   depth.minFilter = depth.magFilter = THREE.NearestFilter;
   const rtScene = new THREE.WebGLRenderTarget(1, 1, { ...hdr, samples, depthBuffer: true, depthTexture: depth });
   const rtComposite = new THREE.WebGLRenderTarget(1, 1, { ...hdr, depthBuffer: false });
   const rtFire = new THREE.WebGLRenderTarget(1, 1, { ...hdr, depthBuffer: false });
+  const rtBlur = new THREE.WebGLRenderTarget(1, 1, { ...hdr, depthBuffer: false });
   const rtDown = [];
   const rtUp = [];
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 4; i++) {
     rtDown.push(new THREE.WebGLRenderTarget(1, 1, { ...hdr, depthBuffer: false }));
     rtUp.push(new THREE.WebGLRenderTarget(1, 1, { ...hdr, depthBuffer: false }));
   }
@@ -501,29 +506,129 @@ export function createFrame(renderer, field, { samples = 4, fireScale = 0.5, blo
     }`,
     { tSrc: { value: null }, tPrev: { value: null }, uTexel: { value: new THREE.Vector2() }, uMix: { value: 0.85 } },
   );
-  const finalMaterial = fs(
+  const distBlurMaterial = fs(
     head +
       /* glsl */ `
-    uniform sampler2D tHdr, tBloom; uniform float uBloom, uExposure, uVignette, uPaint; uniform vec2 uPaintTexel; uniform highp sampler2D tDepth;
+    uniform sampler2D tHdr;
+    uniform highp sampler2D tDepth;
+    uniform vec2 uTexel, uCamPlanes;
+    uniform float uBlurCut;
+    void main() {
+      vec3 c0 = textureLod(tHdr, vUv, 0.0).rgb;
+      float d0 = textureLod(tDepth, vUv, 0.0).r;
+      float n = uCamPlanes.x;
+      float f = uCamPlanes.y;
+      float cutDepth = (f * max(uBlurCut - n, 0.0)) / max(uBlurCut * (f - n), 1e-5);
+      // Suppress foreground weight when background pixels sit inside the kernel so hero/near trees never halo into hills.
+      float w0 = d0 >= cutDepth ? 1.0 : 0.02;
+      vec3 acc = c0 * w0;
+      float wsum = w0;
+      vec2 off = uTexel * 2.2;
+      for (int k = 0; k < 4; k++) {
+        vec2 dir = k == 0 ? vec2(-1.0, -1.0) : k == 1 ? vec2(1.0, -1.0) : k == 2 ? vec2(-1.0, 1.0) : vec2(1.0, 1.0);
+        vec2 u = vUv + dir * off;
+        float di = textureLod(tDepth, u, 0.0).r;
+        float w = di >= cutDepth ? 1.0 : 0.02;
+        acc += textureLod(tHdr, u, 0.0).rgb * w;
+        wsum += w;
+      }
+      outC = vec4(acc / wsum, 1.0);
+    }`,
+    { tHdr: { value: rtComposite.texture }, tDepth: { value: depth }, uTexel: { value: new THREE.Vector2() }, uCamPlanes: { value: new THREE.Vector2(near, far) }, uBlurCut: { value: blurStart * 0.85 } },
+  );
+  const finishTail = /* glsl */ `
+    uniform sampler2D tHdr, tBloom, tDistBlur; uniform float uBloom, uExposure, uVignette, uInk, uDistBlur; uniform vec2 uPaintTexel, uCamPlanes, uBlurRange; uniform vec4 uInkBox; uniform highp sampler2D tDepth;
+    // The inked line round a figure. A figure's parts each write a small alpha of their own (valley/wanderer.js),
+    // smaller than anything else writes; where one of those meets a different alpha, there is a line.
+    float inkAt(vec2 uv, float a, float da) {
+      vec2 w = uPaintTexel * max(1.0, 1.0 / (uPaintTexel.y * 1080.0));
+      float e = 0.0;
+      for (int k = 0; k < 4; k++) {
+        vec2 o = k == 0 ? vec2(1.0, 0.0) : k == 1 ? vec2(-1.0, 0.0) : k == 2 ? vec2(0.0, 1.0) : vec2(0.0, -1.0);
+        float b = textureLod(tHdr, uv + o * w, 0.0).a;
+        if (min(a, b) >= 0.23) continue;
+        // (a line where the figure stands in front of something, or one of its parts meets another: none where a
+        // blade of grass stands in front of it, or every blade would be inked)
+        float db = textureLod(tDepth, uv + o * w, 0.0).r;
+        if (max(a, b) >= 0.23 && (a < b ? db < da : da < db)) continue;
+        e = max(e, abs(a - b));
+      }
+      return smoothstep(0.008, 0.022, e);
+    }
+    vec3 toSrgb(vec3 c) { return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c)); }
+    vec4 finishColor(vec3 c, float alpha, bool inInk, float dc) {
+      if (uDistBlur > 0.01) {
+        float away = (uCamPlanes.x * uCamPlanes.y) / max(uCamPlanes.y - dc * (uCamPlanes.y - uCamPlanes.x), 1e-4);
+        float skyFade = dc >= 0.99995 ? (alpha < 0.98 ? 0.55 : 0.0) : 1.0;
+        float blurK = clamp(uDistBlur * 0.72, 0.0, 0.85) * smoothstep(uBlurRange.x, uBlurRange.y, away) * skyFade;
+        if (inInk && alpha < 0.25) blurK = 0.0;
+        if (blurK > 0.001) c = mix(c, texture(tDistBlur, vUv).rgb, blurK);
+      }
+      if (uBloom > 0.0) c += texture(tBloom, vUv).rgb * uBloom;
+      // (the line is the colour under it, gone dark and a little warm: never a black wire)
+      if (inInk) c = mix(c, min(c, vec3(1.2)) * vec3(0.2, 0.14, 0.15), inkAt(vUv, alpha, dc) * 0.92);
+      vec2 d = vUv - 0.5;
+      c *= 1.0 - uVignette * dot(d, d) * 1.6;
+      c *= uExposure;
+      // a painter's curve: what is below white stays as it was mixed, and only the brightest lights are eased in
+      vec3 hi = max(c - 0.62, 0.0);
+      c = min(c, 0.62) + 0.38 * (1.0 - exp(-hi / 0.38));
+      float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+      c = toSrgb(max(mix(vec3(l), c, 1.06), 0.0));
+      float n = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+      return vec4(c + (n - 0.5) / 255.0, 1.0);
+    }`;
+  const finishUniforms = () => ({
+    tHdr: { value: rtComposite.texture },
+    tBloom: { value: rtUp[0].texture },
+    tDistBlur: { value: rtBlur.texture },
+    uBloom: { value: bloom },
+    uDistBlur: { value: distBlur },
+    uExposure: { value: exposure },
+    uVignette: { value: 0.14 },
+    uInk: { value: ink },
+    uInkBox: { value: new THREE.Vector4(0, 0, 1, 1) },
+    tDepth: { value: depth },
+    uPaintTexel: { value: new THREE.Vector2(1, 1) },
+    uCamPlanes: { value: new THREE.Vector2(near, far) },
+    uBlurRange: { value: new THREE.Vector2(blurStart, blurEnd) },
+  });
+  // Separate paint-off final shader keeps VGPR pressure low when paint smoothing is disabled.
+  const finalCleanMaterial = fs(
+    head +
+      finishTail +
+      /* glsl */ `
+    void main() {
+      vec4 center = textureLod(tHdr, vUv, 0.0);
+      bool inInk = uInk > 0.5 && vUv.x >= uInkBox.x && vUv.x <= uInkBox.z && vUv.y >= uInkBox.y && vUv.y <= uInkBox.w;
+      float dc = (inInk || uDistBlur > 0.01) ? textureLod(tDepth, vUv, 0.0).r : 0.0;
+      outC = finishColor(center.rgb, center.a, inInk, dc);
+    }`,
+    finishUniforms(),
+  );
+  const finalMaterial = fs(
+    head +
+      finishTail +
+      /* glsl */ `
+    uniform float uPaint;
     // The frame as paint: round each point, four overlapping patches; the calmest of them gives its colour. Edges
     // stay where they are and everything between them goes flat, as a loaded brush leaves it.
-    vec3 painted(vec2 uv) {
+    vec3 painted(vec2 uv, vec4 center, float dc) {
+      // (what is painted already, or far away sky/horizon, keeps its detail)
+      if (center.a < 0.6 || dc >= 0.9994) return center.rgb;
       // a finer brush for what is near: grass at your feet keeps its blades, the far country goes to flat paint
-      float away = 0.12 / max(1.0 - textureLod(tDepth, uv, 0.0).r, 1e-6);
-      int r = int(uPaint);
-      // (what is painted already keeps its detail)
-      bool done = textureLod(tHdr, uv, 0.0).a < 0.6;
-      // The brush is broadest in the middle distance, where grass is a mass. Near, it leaves the strokes of the
-      // blades alone; far off, where a house is a few pixels across, it leaves those alone too.
-      r = min(r, 2);
-      if (away < 16.0 || away > 140.0) r = 1;
-      if (done) r = 0;
+      float away = 0.12 / max(1.0 - dc, 1e-6);
+      if (away > 180.0) return center.rgb;
+      bool mid = away >= 16.0 && away <= 140.0;
+      int r = (uPaint >= 2.5 && mid) ? 2 : 1;
+      float stepPx = (uPaint < 2.5 && uPaint >= 1.5 && mid) ? 2.0 : 1.0;
+      vec2 stepUv = uPaintTexel * stepPx;
       vec3 m[4];
       vec3 s[4];
       for (int k = 0; k < 4; k++) { m[k] = vec3(0.0); s[k] = vec3(0.0); }
       for (int j = -r; j <= r; j++) {
         for (int i = -r; i <= r; i++) {
-          vec3 c = textureLod(tHdr, uv + vec2(float(i), float(j)) * uPaintTexel, 0.0).rgb;
+          vec3 c = (i == 0 && j == 0) ? center.rgb : textureLod(tHdr, uv + vec2(float(i), float(j)) * stepUv, 0.0).rgb;
           c = c / (1.0 + c);
           vec3 cc = c * c;
           if (i <= 0 && j <= 0) { m[0] += c; s[0] += cc; }
@@ -547,44 +652,15 @@ export function createFrame(renderer, field, { samples = 4, fireScale = 0.5, blo
       vec3 o = sum / total;
       return o / (1.0 - min(o, vec3(0.985)));
     }
-    // The inked line round a figure. A figure's parts each write a small alpha of their own (valley/wanderer.js),
-    // smaller than anything else writes; where one of those meets a different alpha, there is a line.
-    float inkAt(vec2 uv) {
-      float a = textureLod(tHdr, uv, 0.0).a;
-      float da = textureLod(tDepth, uv, 0.0).r;
-      vec2 w = uPaintTexel * max(1.0, 1.0 / (uPaintTexel.y * 1080.0));
-      float e = 0.0;
-      for (int k = 0; k < 4; k++) {
-        vec2 o = k == 0 ? vec2(1.0, 0.0) : k == 1 ? vec2(-1.0, 0.0) : k == 2 ? vec2(0.0, 1.0) : vec2(0.0, -1.0);
-        float b = textureLod(tHdr, uv + o * w, 0.0).a;
-        if (min(a, b) >= 0.23) continue;
-        // (a line where the figure stands in front of something, or one of its parts meets another: none where a
-        // blade of grass stands in front of it, or every blade would be inked)
-        float db = textureLod(tDepth, uv + o * w, 0.0).r;
-        if (max(a, b) >= 0.23 && (a < b ? db < da : da < db)) continue;
-        e = max(e, abs(a - b));
-      }
-      return smoothstep(0.008, 0.022, e);
-    }
-    vec3 aces(vec3 x) { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
-    vec3 toSrgb(vec3 c) { return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c)); }
     void main() {
-      vec3 c = (uPaint > 0.5 ? painted(vUv) : texture(tHdr, vUv).rgb) + texture(tBloom, vUv).rgb * uBloom;
-      // (the line is the colour under it, gone dark and a little warm: never a black wire)
-      c = mix(c, min(c, vec3(1.2)) * vec3(0.2, 0.14, 0.15), inkAt(vUv) * 0.92);
-      vec2 d = vUv - 0.5;
-      c *= 1.0 - uVignette * dot(d, d) * 1.6;
-      c *= uExposure;
-      // a painter's curve: what is below white stays as it was mixed, and only the brightest lights are eased in
-      vec3 hi = max(c - 0.62, 0.0);
-      c = min(c, 0.62) + 0.38 * (1.0 - exp(-hi / 0.38));
-      float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
-      c = toSrgb(max(mix(vec3(l), c, 1.06), 0.0));
-      float n = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
-      outC = vec4(c + (n - 0.5) / 255.0, 1.0);
+      vec4 center = textureLod(tHdr, vUv, 0.0);
+      bool inInk = uInk > 0.5 && vUv.x >= uInkBox.x && vUv.x <= uInkBox.z && vUv.y >= uInkBox.y && vUv.y <= uInkBox.w;
+      float dc = (center.a >= 0.6 || inInk || uDistBlur > 0.01) ? textureLod(tDepth, vUv, 0.0).r : 0.0;
+      outC = finishColor(painted(vUv, center, dc), center.a, inInk, dc);
     }`,
-    { tHdr: { value: rtComposite.texture }, tBloom: { value: rtUp[0].texture }, uBloom: { value: bloom }, uExposure: { value: exposure }, uVignette: { value: 0.14 }, uPaint: { value: 0 }, tDepth: { value: depth }, uPaintTexel: { value: new THREE.Vector2(1, 1) } },
+    { ...finishUniforms(), uPaint: { value: paint } },
   );
+  const inkCorner = new THREE.Vector3();
 
   field.renderer = renderer;
   const size = new THREE.Vector2();
@@ -595,37 +671,120 @@ export function createFrame(renderer, field, { samples = 4, fireScale = 0.5, blo
     renderer.setRenderTarget(target);
     renderer.render(fsScene, fsCamera);
   };
+  let bloomValue = Math.max(0, Number(bloom) || 0);
+  let fallbackBloom = bloomValue > 0 ? bloomValue : 0.1;
+  let bloomEnabled = bloomValue > 0;
+  const bloomPass = {
+    get enabled() {
+      return bloomEnabled;
+    },
+    set enabled(v) {
+      bloomEnabled = Boolean(v);
+      if (bloomEnabled && bloomValue <= 0) bloomValue = fallbackBloom;
+    },
+    get strength() {
+      return bloomValue;
+    },
+    set strength(v) {
+      bloomValue = Math.max(0, Number(v) || 0);
+      if (bloomValue > 0) fallbackBloom = bloomValue;
+    },
+  };
+
+  const BLUR_LEVELS = { off: 0, low: 0.45, medium: 0.75, high: 1 };
+  const normalizeDistBlur = (v) => {
+    if (typeof v === 'string') return BLUR_LEVELS[v] ?? 0.5;
+    return Math.max(0, Math.min(1.5, Number(v) || 0));
+  };
+  let distBlurValue = normalizeDistBlur(distBlur);
+  let camNear = Math.max(1e-3, Number(near) || 0.12);
+  let camFar = Math.max(camNear + 1, Number(far) || 40000);
+  let blurRangeStart = Math.max(1, Number(blurStart) || 55);
+  let blurRangeEnd = Math.max(blurRangeStart + 10, Number(blurEnd) || 240);
+
+  let fireScaleApplied = -1;
   const fit = (w, h) => {
-    if (w === width && h === height) return;
-    width = w;
-    height = h;
-    depth.image.width = w;
-    depth.image.height = h;
-    rtScene.setSize(w, h);
-    rtComposite.setSize(w, h);
-    const fw = Math.max(1, Math.round(w * frame.fireScale));
-    const fh = Math.max(1, Math.round(h * frame.fireScale));
-    rtFire.setSize(fw, fh);
-    compositeMaterial.uniforms.uFireRes.value.set(fw, fh);
-    view.uRes.value.set(w, h);
-    let bw = w;
-    let bh = h;
-    for (let i = 0; i < rtDown.length; i++) {
-      bw = Math.max(1, bw >> 1);
-      bh = Math.max(1, bh >> 1);
-      rtDown[i].setSize(bw, bh);
-      rtUp[i].setSize(bw, bh);
+    if (w !== width || h !== height) {
+      width = w;
+      height = h;
+      depth.image.width = w;
+      depth.image.height = h;
+      rtScene.setSize(w, h);
+      rtComposite.setSize(w, h);
+      rtBlur.setSize(Math.max(1, Math.round(w * 0.25)), Math.max(1, Math.round(h * 0.25)));
+      distBlurMaterial.uniforms.uTexel.value.set(1 / w, 1 / h);
+      view.uRes.value.set(w, h);
+      let bw = Math.max(1, w >> 1);
+      let bh = Math.max(1, h >> 1);
+      for (let i = 0; i < rtDown.length; i++) {
+        bw = Math.max(1, bw >> 1);
+        bh = Math.max(1, bh >> 1);
+        rtDown[i].setSize(bw, bh);
+        rtUp[i].setSize(bw, bh);
+      }
+      fireScaleApplied = -1;
+    }
+    if (frame.fireScale !== fireScaleApplied) {
+      fireScaleApplied = frame.fireScale;
+      const fw = Math.max(1, Math.round(w * frame.fireScale));
+      const fh = Math.max(1, Math.round(h * frame.fireScale));
+      rtFire.setSize(fw, fh);
+      compositeMaterial.uniforms.uFireRes.value.set(fw, fh);
     }
   };
 
   const frame = {
-    bloom,
+    get bloom() {
+      return bloomEnabled ? bloomValue : 0;
+    },
+    set bloom(v) {
+      if (typeof v === 'boolean') {
+        bloomEnabled = v;
+        if (bloomEnabled && bloomValue <= 0) bloomValue = fallbackBloom;
+        return;
+      }
+      const n = Math.max(0, Number(v) || 0);
+      if (n > 0) {
+        bloomValue = n;
+        fallbackBloom = n;
+        bloomEnabled = true;
+      } else {
+        bloomEnabled = false;
+      }
+    },
+    bloomPass,
+    get distBlur() {
+      return distBlurValue;
+    },
+    set distBlur(v) {
+      distBlurValue = normalizeDistBlur(v);
+    },
+    setDistanceBlur(v) {
+      distBlurValue = normalizeDistBlur(v);
+      return distBlurValue;
+    },
+    setCameraPlanes(n, f) {
+      camNear = Math.max(1e-3, Number(n) || 0.12);
+      camFar = Math.max(camNear + 1, Number(f) || 40000);
+    },
+    setBlurRange(start, end) {
+      blurRangeStart = Math.max(1, Number(start) || 55);
+      blurRangeEnd = Math.max(blurRangeStart + 10, Number(end) || 240);
+    },
     exposure,
     fireScale,
+    paint,
+    ink,
     particles,
     /** A flame to carry: set .position (its foot) and .size (its height in metres, 0 for none). */
     torch: { position: new THREE.Vector3(), size: 0 },
     rtScene,
+    setSize(w, h, pixelRatio) {
+      if (pixelRatio != null) renderer.setPixelRatio(pixelRatio);
+      if (w != null && h != null) renderer.setSize(w, h, false);
+      renderer.getDrawingBufferSize(size);
+      fit(size.x, size.y);
+    },
     update(dt, camera) {
       particles.update(dt, camera);
     },
@@ -651,42 +810,92 @@ export function createFrame(renderer, field, { samples = 4, fireScale = 0.5, blo
       renderer.setRenderTarget(rtScene);
       renderer.render(scene, camera);
       const anyFire = state.burning > 0 || frame.torch.size > 0;
-      if (anyFire) pass(marchMaterial, rtFire);
-      else {
-        renderer.setRenderTarget(rtFire);
-        renderer.setClearColor(0x000000, 0);
-        renderer.clear();
-      }
-      pass(compositeMaterial, rtComposite);
-      if (particles.count) {
-        const auto = renderer.autoClear;
-        renderer.autoClear = false;
-        renderer.setRenderTarget(rtComposite);
-        renderer.render(particles.scene, camera);
-        renderer.autoClear = auto;
+      const needComposite = anyFire || particles.count > 0;
+      let hdrTarget = rtScene;
+      if (needComposite) {
+        if (anyFire) pass(marchMaterial, rtFire);
+        else {
+          renderer.setRenderTarget(rtFire);
+          renderer.setClearColor(0x000000, 0);
+          renderer.clear();
+        }
+        pass(compositeMaterial, rtComposite);
+        if (particles.count) {
+          const auto = renderer.autoClear;
+          renderer.autoClear = false;
+          renderer.setRenderTarget(rtComposite);
+          renderer.render(particles.scene, camera);
+          renderer.autoClear = auto;
+        }
+        hdrTarget = rtComposite;
       }
 
-      let src = rtComposite;
-      for (let i = 0; i < rtDown.length; i++) {
-        const m = i === 0 ? bloomFirst : bloomDown;
-        m.uniforms.tSrc.value = src.texture;
-        m.uniforms.uTexel.value.set(0.5 / rtDown[i].width, 0.5 / rtDown[i].height);
-        pass(m, rtDown[i]);
-        src = rtDown[i];
+      const activeDistBlur = distBlurValue > 0.01 ? distBlurValue : 0;
+      if (activeDistBlur > 0) {
+        distBlurMaterial.uniforms.tHdr.value = hdrTarget.texture;
+        distBlurMaterial.uniforms.uCamPlanes.value.set(camNear, camFar);
+        distBlurMaterial.uniforms.uBlurCut.value = blurRangeStart * 0.85;
+        pass(distBlurMaterial, rtBlur);
       }
-      let prev = rtDown[rtDown.length - 1];
-      for (let i = rtDown.length - 2; i >= 0; i--) {
-        bloomUp.uniforms.tSrc.value = rtDown[i].texture;
-        bloomUp.uniforms.tPrev.value = prev.texture;
-        bloomUp.uniforms.uTexel.value.set(0.5 / prev.width, 0.5 / prev.height);
-        pass(bloomUp, rtUp[i]);
-        prev = rtUp[i];
+
+      const activeBloom = bloomEnabled && bloomValue > 0 ? bloomValue : 0;
+      if (activeBloom > 0) {
+        let src = hdrTarget;
+        for (let i = 0; i < rtDown.length; i++) {
+          const m = i === 0 ? bloomFirst : bloomDown;
+          m.uniforms.tSrc.value = src.texture;
+          m.uniforms.uTexel.value.set(0.5 / rtDown[i].width, 0.5 / rtDown[i].height);
+          pass(m, rtDown[i]);
+          src = rtDown[i];
+        }
+        let prev = rtDown[rtDown.length - 1];
+        for (let i = rtDown.length - 2; i >= 0; i--) {
+          bloomUp.uniforms.tSrc.value = rtDown[i].texture;
+          bloomUp.uniforms.tPrev.value = prev.texture;
+          bloomUp.uniforms.uTexel.value.set(0.5 / prev.width, 0.5 / prev.height);
+          pass(bloomUp, rtUp[i]);
+          prev = rtUp[i];
+        }
       }
-      finalMaterial.uniforms.uBloom.value = frame.bloom;
-      finalMaterial.uniforms.uExposure.value = frame.exposure;
-      finalMaterial.uniforms.uPaint.value = frame.paint ?? 0;
-      finalMaterial.uniforms.uPaintTexel.value.set(1 / size.x, 1 / size.y);
-      pass(finalMaterial, null);
+      const paintLevel = frame.paint ?? 0;
+      const inkLevel = frame.ink ?? 1;
+      const outMat = paintLevel > 0.5 ? finalMaterial : finalCleanMaterial;
+      const fu = outMat.uniforms;
+      fu.tHdr.value = hdrTarget.texture;
+      fu.uBloom.value = activeBloom;
+      fu.uDistBlur.value = activeDistBlur;
+      fu.uCamPlanes.value.set(camNear, camFar);
+      fu.uBlurRange.value.set(blurRangeStart, blurRangeEnd);
+      fu.uExposure.value = frame.exposure;
+      if (fu.uPaint) fu.uPaint.value = paintLevel;
+      fu.uInk.value = inkLevel;
+      fu.uPaintTexel.value.set(1 / size.x, 1 / size.y);
+      const wlk = field.uniforms.uWalker.value;
+      const inkBox = fu.uInkBox.value;
+      if (inkLevel > 0.5 && wlk.w > 0) {
+        const wy = field.heightAt(wlk.x, wlk.z);
+        let minX = 2, minY = 2, maxX = -2, maxY = -2, clipped = false;
+        for (let i = 0; i < 8; i++) {
+          inkCorner.set(
+            wlk.x + (i & 1 ? 1.15 : -1.15),
+            wy + (i & 2 ? 2.45 : -0.35),
+            wlk.z + (i & 4 ? 1.15 : -1.15),
+          ).project(camera);
+          if (inkCorner.z < -1 || inkCorner.z > 1) { clipped = true; break; }
+          const u = inkCorner.x * 0.5 + 0.5;
+          const v = inkCorner.y * 0.5 + 0.5;
+          if (u < minX) minX = u;
+          if (u > maxX) maxX = u;
+          if (v < minY) minY = v;
+          if (v > maxY) maxY = v;
+        }
+        if (clipped) inkBox.set(0, 0, 1, 1);
+        else if (maxX < 0 || minX > 1 || maxY < 0 || minY > 1) inkBox.set(-1, -1, -1, -1);
+        else inkBox.set(Math.max(0, minX - 0.01), Math.max(0, minY - 0.01), Math.min(1, maxX + 0.01), Math.min(1, maxY + 0.01));
+      } else {
+        inkBox.set(-1, -1, -1, -1);
+      }
+      pass(outMat, null);
     },
     /**
      * Compiles every shader the frame and the scene use, for the scene's own target, and sends every texture they
@@ -715,7 +924,7 @@ export function createFrame(renderer, field, { samples = 4, fireScale = 0.5, blo
         if (!first.has(o.material)) first.set(o.material, o);
         collect(o.material);
       });
-      const steps = first.size + textures.size + 8;
+      const steps = first.size + textures.size + 9;
       let done = 0;
       const step = async () => {
         onStep?.(++done, steps);
@@ -739,9 +948,9 @@ export function createFrame(renderer, field, { samples = 4, fireScale = 0.5, blo
       jobs.push(renderer.compileAsync(particles.scene, camera));
       renderer.setRenderTarget(target);
       await step();
-      for (const m of [marchMaterial, compositeMaterial, bloomFirst, bloomDown, bloomUp, finalMaterial]) {
+      for (const m of [marchMaterial, compositeMaterial, bloomFirst, bloomDown, bloomUp, distBlurMaterial, finalCleanMaterial, finalMaterial]) {
         fsMesh.material = m;
-        renderer.setRenderTarget(m === marchMaterial ? rtFire : rtComposite);
+        renderer.setRenderTarget(m === marchMaterial ? rtFire : m === distBlurMaterial ? rtBlur : rtComposite);
         jobs.push(renderer.compileAsync(fsScene, fsCamera));
         renderer.setRenderTarget(target);
         await step();

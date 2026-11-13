@@ -14,6 +14,15 @@ import { createFluff, createStones } from './dressing.js';
 import { createFarWoods } from './farwoods.js';
 import { createFloor, FLOOR, paintFloor } from './floor.js';
 import { createHorizon } from './horizon.js';
+import {
+  createSettingsUI,
+  detectHardwarePreset,
+  loadSettings,
+  resolveEffectiveBloom,
+  resolveEffectiveChunkRange,
+  resolveEffectiveDistanceBlur,
+  resolveEffectiveQuality,
+} from './settings.js';
 import { createSky, createSkyParts, SUNSET } from './sky.js';
 import { createSounds } from './sounds.js';
 import { createStrokes } from './strokes.js';
@@ -76,18 +85,40 @@ const offThread = (message, here) =>
       fallback();
     }
   });
-const quality = params.get('quality') ?? 'high';
+const settings = loadSettings(params);
+
 const EXTENT = 1280;
 const GROUND = { extent: EXTENT, extentRes: EXTENT, centre: [0, 0] };
-const FLOOR_SIZE = quality === 'low' ? 1024 : 1536;
-const hour0 = params.has('hour') ? Number(params.get('hour')) : 15.5;
+const hour0 = Math.min(SUNSET, Math.max(12, settings.hour));
 const groundJob = offThread({ job: 'ground', ...GROUND }, () => bakeGround({ heightAt, paint, ...GROUND }));
-const floorJob = offThread({ job: 'floor', size: FLOOR_SIZE }, () => ({ pixels: paintFloor(FLOOR_SIZE) }));
 await stage(0.04, 'Painting the sky');
 // Sound is made ready now, while the land is being made: opening the PC's audio can hold a page's thread for a
 // second or more, and here nothing is waiting on it. It only starts playing on the first click.
+let audioCtx = null;
+let soundEnabled = settings.sound;
+const noSoundParam = params.has('nosound');
 const sounds = createSounds();
-const soundsReady = params.has('nosound') ? null : sounds.load();
+let soundsReady = null;
+if (!noSoundParam) {
+  const NativeAudioContext = window.AudioContext;
+  const NativeWebkitAudioContext = window.webkitAudioContext;
+  const wrapAudioContext = (Ctor) => {
+    if (!Ctor) return Ctor;
+    return class extends Ctor {
+      constructor(...args) {
+        super(...args);
+        audioCtx = this;
+        if (!soundEnabled && this.state === 'running') this.suspend().catch(() => {});
+      }
+    };
+  };
+  if (NativeAudioContext) window.AudioContext = wrapAudioContext(NativeAudioContext);
+  if (NativeWebkitAudioContext) window.webkitAudioContext = wrapAudioContext(NativeWebkitAudioContext);
+  soundsReady = Promise.resolve(sounds.load()).finally(() => {
+    if (NativeAudioContext) window.AudioContext = NativeAudioContext;
+    if (NativeWebkitAudioContext) window.webkitAudioContext = NativeWebkitAudioContext;
+  });
+}
 
 const canvas = $('view');
 let renderer;
@@ -97,18 +128,63 @@ try {
   $('loading').textContent = 'Needs WebGL 2';
   throw new Error('no WebGL 2');
 }
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, params.has('dpr') ? Number(params.get('dpr')) : 1.5));
-renderer.setSize(window.innerWidth, window.innerHeight);
+const gl = renderer.getContext();
+const dbgInfo = gl.getExtension('WEBGL_debug_renderer_info');
+const rawGpu = dbgInfo ? gl.getParameter(dbgInfo.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+const gpuName = rawGpu ? String(rawGpu) : '';
+const integratedGpu =
+  /\b(intel|uhd|iris|hd graphics|vega|apple|swiftshader|llvmpipe|mesa)\b|radeon\(tm\)\s*graphics/i.test(gpuName)
+  && !/\b(rtx|gtx|geforce|quadro|radeon\s+(?:rx|pro)|rx\s+[4-9]\d{2,3}|vega\s+(?:56|64)|arc)\b/i.test(gpuName);
+const cores = Number(navigator.hardwareConcurrency) || undefined;
+const memoryGB = Number(navigator.deviceMemory) || undefined;
+const hardwareInfo = { gpuName, integratedGpu, cores, memoryGB };
+const hardwarePreset = detectHardwarePreset(hardwareInfo);
+const quality = resolveEffectiveQuality(settings.quality, hardwareInfo);
+
+const CHUNK_PRESETS = {
+  low: { trees: 320, farWoods: 1900, blades: 0.78, blur: [50, 210] },
+  medium: { trees: 560, farWoods: 3400, blades: 1.0, blur: [60, 250] },
+  high: { trees: 1280, farWoods: 6200, blades: 1.18, blur: [75, 320] },
+};
+const initialChunkRange = resolveEffectiveChunkRange(settings.chunkRange, quality);
+const initialChunkCfg = CHUNK_PRESETS[initialChunkRange] ?? CHUNK_PRESETS.low;
+const initialDistanceBlur = resolveEffectiveDistanceBlur(settings.distanceBlur, quality);
+
+const FLOOR_SIZE = quality === 'low' ? 1024 : 1536;
+const floorJob = offThread({ job: 'floor', size: FLOOR_SIZE }, () => ({ pixels: paintFloor(FLOOR_SIZE) }));
+
+let activeRenderScale = settings.renderScale;
+let userFov = settings.fov;
+let frame = null;
+let settingsUI = null;
+const renderSize = new THREE.Vector2();
+function resolvePixelRatio(scale = activeRenderScale) {
+  const nativeDpr = window.devicePixelRatio || 1;
+  if (scale !== null && scale !== undefined && Number.isFinite(scale)) return scale;
+  if (quality === 'low') return 0.75;
+  if (quality === 'medium' || integratedGpu) return Math.min(nativeDpr, 1);
+  return Math.min(nativeDpr, 1.25);
+}
+
+renderer.setPixelRatio(resolvePixelRatio(activeRenderScale));
+renderer.setSize(window.innerWidth, window.innerHeight, false);
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(68, window.innerWidth / window.innerHeight, 0.12, 40000);
+const camera = new THREE.PerspectiveCamera(userFov, window.innerWidth / window.innerHeight, 0.12, 40000);
 camera.rotation.order = 'YXZ';
 // Listened for from the start, not once loaded: the page may go fullscreen while the valley is still being made.
 // The frame's targets follow the renderer's size on their own, each time it draws.
 function fitView() {
-  renderer.setSize(window.innerWidth, window.innerHeight);
+  const ratio = resolvePixelRatio(activeRenderScale);
+  if (typeof frame?.setSize === 'function') {
+    frame.setSize(window.innerWidth, window.innerHeight, ratio);
+  } else {
+    renderer.setPixelRatio(ratio);
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
+  }
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
+  if (settingsUI?.isOpen()) pushTelemetry();
 }
 window.addEventListener('resize', fitView);
 
@@ -116,10 +192,10 @@ const groundTextures = loadGroundTextures(renderer, './textures/');
 // The sky's clouds and mountains need nothing from the land and are the graphics card's work, most of the wait on
 // a fast PC: begun now, they are painted while the land is still being worked out.
 const skyParts = createSkyParts(renderer, {
-  cloudSize: quality === 'low' ? 512 : quality === 'medium' ? 1024 : 2048,
-  cloudSteps: quality === 'low' ? 150 : 240,
+  cloudSize: quality === 'low' ? 512 : quality === 'medium' || integratedGpu ? 1024 : 1536,
+  cloudSteps: quality === 'low' ? 96 : 150,
   liveClouds: quality !== 'low',
-  backdropWidth: quality === 'high' ? 12288 : 4096,
+  backdropWidth: quality === 'low' ? 4096 : quality === 'medium' || integratedGpu ? 6144 : 8192,
 });
 const skyReady = (async () => {
   const from = performance.now();
@@ -148,10 +224,12 @@ const field = createField({
   size: 256,
   baked,
   textures: await groundTextures,
-  density: quality === 'low' ? 0.45 : quality === 'medium' ? 0.7 : 1,
+  density: quality === 'low' ? 0.45 : quality === 'medium' ? 0.65 : integratedGpu ? 0.85 : 1,
+  flowers: quality !== 'low',
   height: 0.5,
   seed: 3,
 });
+field.blades?.setRangeScale?.(initialChunkCfg.blades);
 scene.add(field.group);
 // (the wanderer is the biggest thing to fetch: asked for now, he arrives while the rest is made)
 const wandererComing = createWanderer(field);
@@ -187,18 +265,46 @@ mark('strokes');
 }
 mark('floor');
 await stage(0.3, 'Building the village');
-const frame = createFrame(renderer, field, { samples: quality === 'low' ? 0 : 4, bloom: 0.1 });
+const samples = settings.samples !== null ? settings.samples : quality === 'low' || integratedGpu ? 0 : quality === 'medium' ? 2 : 4;
+const cutout = samples === 0;
+const resolvePaint = (pref) => {
+  if (pref !== 'auto') return Number(pref);
+  return quality === 'low' ? 0 : quality === 'medium' || integratedGpu ? 2 : 3;
+};
+const initialPaint = resolvePaint(settings.paint);
+const initialBloom = resolveEffectiveBloom(settings.bloom, quality);
+frame = createFrame(renderer, field, {
+  samples,
+  bloom: initialBloom,
+  paint: initialPaint,
+  distBlur: initialDistanceBlur,
+  near: camera.near,
+  far: camera.far,
+  blurStart: initialChunkCfg.blur[0],
+  blurEnd: initialChunkCfg.blur[1],
+});
 mark('frame');
 const sky = createSky(renderer, field, { parts: skyParts });
 mark('sky');
-const trees = createTrees(field, { cards: quality === 'low' ? 0.6 : quality === 'medium' ? 0.8 : 1 });
+const trees = createTrees(field, {
+  cards: quality === 'low' ? 0.55 : quality === 'medium' ? 0.8 : integratedGpu ? 0.9 : 1,
+  cutout,
+  simple: quality === 'low',
+  start: START,
+  viewDistance: initialChunkCfg.trees,
+});
 mark('trees');
-const farWoods = createFarWoods(field);
+const farWoods = createFarWoods(field, {
+  cutout,
+  start: START,
+  viewDistance: initialChunkCfg.farWoods,
+});
 mark('farWoods');
-scene.add(sky.mesh, createHorizon(field, EXTENT / 2), trees.group, farWoods.group, createTarn(field, sky));
+const horizon = createHorizon(field, EXTENT / 2, { simple: quality === 'low' });
+horizon.setViewDistance?.(initialChunkCfg.farWoods);
+scene.add(sky.mesh, horizon, trees.group, farWoods.group, createTarn(field, sky));
 // the finish: the frame laid in as brush marks. ?paint=0 for none; P turns it on and off.
-frame.paint = params.has('paint') ? Number(params.get('paint')) : quality === 'low' ? 0 : quality === 'medium' ? 2 : 3;
-const paintWas = frame.paint || 3;
+let paintWas = initialPaint || 3;
 mark('build');
 await stage(0.45, 'Planting trees');
 const stones = createStones(field);
@@ -206,7 +312,7 @@ scene.add(stones.group);
 if (quality !== 'low' && params.get('seeds') !== '0') scene.add(createFluff(field, quality === 'medium' ? 200 : 320));
 // time passes: the afternoon you start in is sunset twenty minutes later. ?drift=0 holds the hour; T and 1 to 4
 // pick a time of day and hold it there, 0 lets it pass again, and , and . nudge it.
-let drift = params.has('drift') ? Number(params.get('drift')) : 1;
+let drift = params.has('drift') ? Number(params.get('drift')) : settings.timeDrift ? 1 : 0;
 const TIMES = [
   { hour: 12.5, name: 'Noon' },
   { hour: 15.5, name: 'Afternoon' },
@@ -309,7 +415,7 @@ function updatePlayer(dt) {
     player.y += player.vy * dt;
     if (player.y <= ground) {
       field.bend(player.x, player.z, 0.55, 0, 0, Math.min(1, -player.vy / 5));
-      sounds.step(0.7);
+      if (soundEnabled) sounds.step(0.7);
       player.dip = Math.min(0.1, -player.vy * 0.016);
       player.y = ground;
       player.vy = 0;
@@ -336,7 +442,7 @@ function tread(dt, heard) {
     if (player.walked > (pace > 5 ? 1.2 : 0.95)) {
       player.walked = 0;
       player.foot = -player.foot;
-      if (heard) sounds.step(pace > 5 ? 0.42 : 0.28);
+      if (heard && soundEnabled) sounds.step(pace > 5 ? 0.42 : 0.28);
     }
     player.bob += moved * (Math.PI / 0.95);
   }
@@ -351,10 +457,11 @@ const physics = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
   // the ground under him: the meadow's own heights a metre apart, as far as the walk goes, with the trees and the
   // big stones standing on it
   const half = REACH + 40;
-  const cells = 2 * half;
+  const step = 2;
+  const cells = Math.round((2 * half) / step);
   const heights = new Float32Array((cells + 1) * (cells + 1));
   for (let col = 0; col <= cells; col++) {
-    for (let row = 0; row <= cells; row++) heights[row + col * (cells + 1)] = field.heightAt(-half + col, -half + row);
+    for (let row = 0; row <= cells; row++) heights[row + col * (cells + 1)] = field.heightAt(-half + col * step, -half + row * step);
   }
   physics.createCollider(RAPIER.ColliderDesc.heightfield(cells, cells, heights, { x: 2 * half, y: 1, z: 2 * half }));
   for (const [sx, sz, gap] of stones.solid) physics.createCollider(RAPIER.ColliderDesc.cylinder(1, gap * 0.75).setTranslation(sx, field.heightAt(sx, sz), sz));
@@ -371,7 +478,7 @@ const follow = new Follow(camera);
 const input = new Input(canvas, { pads: !stepped && !params.has('nopad') });
 physics.step();
 // V goes between the two walks; ?view=first begins in your own eyes
-let third = params.get('view') !== 'first';
+let third = settings.camera !== 'first';
 const UP = new THREE.Vector3(0, 1, 0);
 const local = new THREE.Vector3();
 const gaze = new THREE.Vector3();
@@ -401,7 +508,8 @@ function standAt(x, z, yaw) {
 function setThird(on) {
   third = on;
   wanderer.group.visible = on;
-  camera.fov = on ? 52 : 68;
+  frame.ink = on ? 1 : 0;
+  camera.fov = userFov;
   camera.updateProjectionMatrix();
   if (on) {
     standAt(player.x, player.z, player.yaw + Math.PI);
@@ -426,7 +534,9 @@ function air(x, y, z, out) {
 }
 
 function updateWanderer(dt) {
-  const inp = input.read(dt);
+  const inp = settingsUI?.isOpen()
+    ? { move: { x: 0, y: 0 }, walk: false, sprint: false, strafe: false, jump: false, look: { x: 0, y: 0 }, zoom: 0, device: 'keyboard' }
+    : input.read(dt);
   held.copy(walker.feet);
   const bodyWas = walker.body.translation();
   walker.update(dt, inp, follow.yaw);
@@ -464,7 +574,7 @@ function updateWanderer(dt) {
     else if (lift < 0.125 && footUp[side]) {
       footUp[side] = false;
       if (onGround && walker.speed > 0.5 && sinceStep > 0.15) {
-        sounds.step(walker.speed > 6 ? 0.42 : walker.speed > 3 ? 0.32 : 0.22);
+        if (soundEnabled) sounds.step(walker.speed > 6 ? 0.42 : walker.speed > 3 ? 0.32 : 0.22);
         sinceStep = 0;
       }
     }
@@ -476,7 +586,7 @@ function updateWanderer(dt) {
   Object.assign(player, { x: at.x, y: at.y, z: at.z, vx: walker.vel.x, vz: walker.vel.z, onGround });
   if (landed) {
     field.bend(player.x, player.z, 0.55, 0, 0, 0.7);
-    sounds.step(0.7);
+    if (soundEnabled) sounds.step(0.7);
   }
   tread(dt, false);
   // his shadow: longer as the sun comes down
@@ -536,6 +646,7 @@ function pickTime(index) {
   drift = 0;
   setHour(time.hour);
   note(time.name);
+  settingsUI?.syncState({ timeDrift: false, hour: sky.hour });
 }
 function setWind(speed) {
   wind.speed = Math.min(12, Math.max(0, speed));
@@ -543,21 +654,26 @@ function setWind(speed) {
 }
 
 canvas.addEventListener('click', () => {
-  sounds.start();
+  if (settingsUI?.isOpen()) return;
+  if (soundEnabled) sounds.start();
   if (document.pointerLockElement !== canvas) canvas.requestPointerLock()?.catch?.(() => {});
 });
 document.addEventListener('pointerlockchange', () => {
   const locked = document.pointerLockElement === canvas;
   document.body.classList.toggle('playing', locked);
-  if (locked) sounds.start();
-  else keys.clear();
+  if (locked) {
+    if (soundEnabled) sounds.start();
+  } else {
+    keys.clear();
+  }
 });
 document.addEventListener('mousemove', (e) => {
-  if (document.pointerLockElement !== canvas) return;
+  if (settingsUI?.isOpen() || document.pointerLockElement !== canvas) return;
   player.yaw -= e.movementX * 0.0021;
   player.pitch = Math.min(1.45, Math.max(-1.45, player.pitch - e.movementY * 0.0021));
 });
 document.addEventListener('keydown', (e) => {
+  if (settingsUI?.isOpen()) return;
   keys.add(e.code);
   // (after the last of them, round to the first again)
   if (e.code === 'KeyT') pickTime(Math.max(0, TIMES.findIndex((time) => time.hour > sky.hour + 0.05)));
@@ -565,13 +681,25 @@ document.addEventListener('keydown', (e) => {
   if (e.code === 'Digit0') {
     drift = 1;
     note('Time passing');
+    settingsUI?.syncState({ timeDrift: true });
   }
-  if (e.code === 'Comma') setHour(sky.hour - 0.25);
-  if (e.code === 'Period') setHour(sky.hour + 0.25);
-  if (e.code === 'KeyP') frame.paint = frame.paint ? 0 : paintWas;
+  if (e.code === 'Comma') {
+    setHour(sky.hour - 0.25);
+    settingsUI?.syncState({ hour: sky.hour });
+  }
+  if (e.code === 'Period') {
+    setHour(sky.hour + 0.25);
+    settingsUI?.syncState({ hour: sky.hour });
+  }
+  if (e.code === 'KeyP') {
+    const nextPaint = frame.paint ? 0 : paintWas;
+    frame.paint = nextPaint;
+    settingsUI?.syncState({ paint: nextPaint });
+  }
   if (e.code === 'KeyV') {
     setThird(!third);
     note(third ? 'Third person' : 'First person');
+    settingsUI?.syncState({ camera: third ? 'third' : 'first' });
   }
   if (e.code === 'Space') e.preventDefault();
 });
@@ -598,10 +726,12 @@ function gpuDone() {
 function tick(dt) {
   if (third) updateWanderer(dt);
   else {
-    input.read(dt);
+    if (!settingsUI?.isOpen()) input.read(dt);
     updatePlayer(dt);
   }
   placeCamera();
+  trees.update(camera.position.x, camera.position.z);
+  farWoods.updateChunks(camera.position.x, camera.position.z);
   field.update(dt, camera);
   farWoods.update(dt, wind.speed);
   frame.update(dt, camera);
@@ -613,17 +743,19 @@ function tick(dt) {
       castAt = sky.hour;
     }
   }
-  // what you hear depends on where you stand: leaves under a tree, water by the tarn, crickets as the light goes
-  let tree = 0;
-  for (const [tx, tz, kind, scale] of trees.trees) {
-    if (kind > 3) break;
-    const reach = (kind === 0 ? 11.5 : 5.6) * scale;
-    const d = Math.hypot(player.x - tx, player.z - tz);
-    tree = Math.max(tree, 1 - Math.min(1, Math.max(0, (d - reach * 0.8) / (reach * 2.2))));
+  if (soundEnabled) {
+    // what you hear depends on where you stand: leaves under a tree, water by the tarn, crickets as the light goes
+    let tree = 0;
+    for (const [tx, tz, kind, scale] of trees.trees) {
+      if (kind > 3) break;
+      const reach = (kind === 0 ? 11.5 : 5.6) * scale;
+      const d = Math.hypot(player.x - tx, player.z - tz);
+      tree = Math.max(tree, 1 - Math.min(1, Math.max(0, (d - reach * 0.8) / (reach * 2.2))));
+    }
+    const tarn = 1 - Math.min(1, Math.max(0, (tarnDistance(player.x, player.z) - 1) / 1.6));
+    const gust = 0.5 + 0.5 * Math.sin(clock * 0.23) * Math.sin(clock * 0.37 + 1);
+    sounds.update(dt, { wind: wind.speed, gust, tree, tarn, dusk: Math.min(1, Math.max(0, (sky.hour - 18.8) / 1.4)) });
   }
-  const tarn = 1 - Math.min(1, Math.max(0, (tarnDistance(player.x, player.z) - 1) / 1.6));
-  const gust = 0.5 + 0.5 * Math.sin(clock * 0.23) * Math.sin(clock * 0.37 + 1);
-  sounds.update(dt, { wind: wind.speed, gust, tree, tarn, dusk: Math.min(1, Math.max(0, (sky.hour - 18.8) / 1.4)) });
   sky.update(dt, camera);
   frame.exposure = sky.exposure;
   frame.render(scene, camera);
@@ -653,25 +785,127 @@ await stage(0.9, 'Warming up');
   const [x0, z0] = [player.x, player.z];
   keys.add('KeyW');
   input.keys.add('KeyW');
-  for (let i = 0; i < 44; i++) {
+  for (let i = 0; i < 6; i++) {
     tick(1 / 30);
     await gpuDone();
-    if (i % 11 === 10) await stage(0.9 + 0.08 * (i / 44), 'Warming up');
   }
+  await stage(0.96, 'Warming up');
   keys.clear();
   input.keys.clear();
   Object.assign(player, { x: x0, z: z0, vx: 0, vz: 0, walked: 0, stride: 0, bob: 0, yaw: Math.atan2(-HERO[0], -HERO[1]), pitch: 0.04 });
   if (third) setThird(true);
   field.reset();
   clock = 0;
-  setHour(params.has('hour') ? Number(params.get('hour')) : 15.5);
+  setHour(hour0);
   tick(1 / 60);
   await gpuDone();
 }
 mark('warm');
 
+function applyChunkRange(range) {
+  const cfg = CHUNK_PRESETS[range] ?? CHUNK_PRESETS.low;
+  trees.setViewDistance(cfg.trees);
+  farWoods.setViewDistance(cfg.farWoods);
+  horizon.setViewDistance?.(cfg.farWoods);
+  field.blades?.setRangeScale?.(cfg.blades);
+  frame?.setBlurRange?.(cfg.blur[0], cfg.blur[1]);
+  trees.update(camera.position.x, camera.position.z);
+  farWoods.updateChunks(camera.position.x, camera.position.z);
+  if (settingsUI?.isOpen()) pushTelemetry();
+}
+
+let fpsFrames = 0;
+let fpsAt = performance.now();
+let currentFps = Number.NaN;
+function getTelemetry() {
+  renderer.getDrawingBufferSize(renderSize);
+  const ts = trees.stats();
+  const fs = farWoods.stats();
+  return {
+    fps: currentFps,
+    gpuName,
+    integratedGpu,
+    width: renderSize.x,
+    height: renderSize.y,
+    pixelRatio: renderer.getPixelRatio(),
+    effectiveQuality: quality,
+    qualityPref: settings.quality,
+    chunks: {
+      built: ts.builtChunks + fs.builtChunks,
+      total: ts.totalChunks + fs.totalChunks,
+      visible: ts.visibleChunks + fs.visibleChunks,
+    },
+  };
+}
+function pushTelemetry(now = performance.now()) {
+  if (!settingsUI) return;
+  settingsUI.updateTelemetry(getTelemetry());
+  fpsAt = now;
+}
+
+settingsUI = createSettingsUI({
+  initialSettings: settings,
+  effectiveQuality: quality,
+  hardwarePreset,
+  gpuName,
+  integratedGpu,
+  cores,
+  memoryGB,
+  getTelemetry,
+  getRuntimeState: () => ({
+    camera: third ? 'third' : 'first',
+    sound: soundEnabled,
+    timeDrift: drift > 0,
+    hour: sky.hour,
+  }),
+  onChunkRangeChange(resolvedChunk) {
+    applyChunkRange(resolvedChunk);
+  },
+  onDistanceBlurChange(resolvedBlur) {
+    frame.setDistanceBlur(resolvedBlur);
+  },
+  onCameraChange(cam) {
+    const wantThird = cam !== 'first';
+    if (wantThird !== third) setThird(wantThird);
+  },
+  onSoundChange(on) {
+    soundEnabled = Boolean(on);
+    if (sounds.setMuted) {
+      sounds.setMuted(!soundEnabled);
+      if (soundEnabled) sounds.start();
+      return;
+    }
+    if (!soundEnabled) {
+      if (audioCtx && audioCtx.state === 'running') audioCtx.suspend().catch(() => {});
+    } else if (!noSoundParam) {
+      if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+      sounds.start();
+    }
+  },
+  onOpen() {
+    input.lockable = false;
+    keys.clear();
+    input.keys.clear();
+    input.pressed.clear();
+    input.mouse.x = input.mouse.y = input.mouse.wheel = 0;
+    input.mouse.right = false;
+  },
+  onClose() {
+    input.keys.clear();
+    input.pressed.clear();
+    input.mouse.x = input.mouse.y = input.mouse.wheel = 0;
+    input.mouse.right = false;
+    input.lockable = true;
+  },
+  requestPointerLock() {
+    input.lockable = true;
+    if (soundEnabled) sounds.start();
+    if (document.pointerLockElement !== canvas) canvas.requestPointerLock()?.catch?.(() => {});
+  },
+});
+
 // for tests and filming: everything the page is made of, and a clock to drive by hand
-window.__tg = { sounds, walker, follow, input, wanderer, animator, setThird, standAt, pickTime, timings, view: null, wind, THREE, renderer, scene, camera, field, frame, sky, trees, farWoods, stones, player, keys, tick, setHour, setWind, fromValley, ready: true };
+window.__tg = { sounds, walker, follow, input, wanderer, animator, setThird, standAt, pickTime, timings, view: null, wind, THREE, renderer, scene, camera, field, frame, sky, trees, farWoods, horizon, stones, player, keys, tick, setHour, setWind, fromValley, settings: settingsUI, quality, hardwarePreset, integratedGpu, gpuName, ready: true };
 
 // ---- the loop's switch ----------------------------------------------------------------------------------------
 let last = 0;
@@ -682,12 +916,21 @@ function run() {
   if (want === running) return;
   running = want;
   last = performance.now();
+  fpsFrames = 0;
+  fpsAt = last;
   renderer.setAnimationLoop(
     want
       ? (now) => {
           const dt = Math.min(0.05, Math.max(0, (now - last) / 1000));
           last = now;
           tick(dt);
+          fpsFrames++;
+          if (now - fpsAt >= 450) {
+            currentFps = (fpsFrames * 1000) / (now - fpsAt);
+            fpsFrames = 0;
+            fpsAt = now;
+            if (settingsUI?.isOpen()) pushTelemetry(now);
+          }
         }
       : null,
   );
@@ -696,6 +939,7 @@ function run() {
 fitView();
 loaded = true;
 run();
+pushTelemetry();
 $('loading').remove();
 document.body.classList.add('ready');
 block.ready();

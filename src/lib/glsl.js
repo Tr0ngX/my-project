@@ -255,21 +255,27 @@ vec3 heroPaint(vec3 g, vec3 world, vec2 q, vec2 w, float dist) {
   float px = max(w.x, w.y);
   // soft patches of three greens at two sizes, and long strokes of them lying level
   float soft = k * (1.0 - smoothstep(0.0015, 0.005, px));
-  float v = texture(tNoiseHi, q / 0.42 + 0.2).r * 0.4 + texture(tNoiseHi, q / 0.15 + 0.6).g * 0.3 + texture(tNoiseHi, vec2(q.x / 0.5, q.y / 0.07) + 0.4).b * 0.3;
-  g *= mix(vec3(1.0), vec3(0.7, 0.87, 1.0), (1.0 - smoothstep(0.42, 0.48, v)) * soft * 0.9);
-  g *= mix(vec3(1.0), vec3(1.34, 1.15, 0.8), smoothstep(0.53, 0.59, v) * soft * 0.9);
+  if (soft > 0.001) {
+    float v = texture(tNoiseHi, q / 0.42 + 0.2).r * 0.4 + texture(tNoiseHi, q / 0.15 + 0.6).g * 0.3 + texture(tNoiseHi, vec2(q.x / 0.5, q.y / 0.07) + 0.4).b * 0.3;
+    g *= mix(vec3(1.0), vec3(0.7, 0.87, 1.0), (1.0 - smoothstep(0.42, 0.48, v)) * soft * 0.9);
+    g *= mix(vec3(1.0), vec3(1.34, 1.15, 0.8), smoothstep(0.53, 0.59, v) * soft * 0.9);
+  }
   // clumps of rough grass, gathered into masses as the woods on the hills are
   float coarse = k * (1.0 - smoothstep(0.3, 0.7, px * 70.0)) * smoothstep(0.016, 0.03, px * 70.0);
-  vec3 t = paintCells(q * 70.0);
-  float mass = smoothstep(0.48, 0.56, texture(tNoiseHi, q / 0.3 + 0.7).a);
-  g *= mix(vec3(1.0), vec3(0.62, 0.82, 0.9), smoothstep(0.1, 0.2, t.x) * step(t.y, 0.34 * mass + 0.04) * coarse);
+  if (coarse > 0.001) {
+    vec3 t = paintCells(q * 70.0);
+    float mass = smoothstep(0.48, 0.56, texture(tNoiseHi, q / 0.3 + 0.7).a);
+    g *= mix(vec3(1.0), vec3(0.62, 0.82, 0.9), smoothstep(0.1, 0.2, t.x) * step(t.y, 0.34 * mass + 0.04) * coarse);
+  }
   // dabs: a darker tuft, a fleck of sun, a few flowers
   float fine = k * (1.0 - smoothstep(0.3, 0.7, px * 220.0)) * smoothstep(0.05, 0.09, px * 220.0);
-  vec3 c = paintCells(q * 220.0);
-  float dab = smoothstep(0.1, 0.22, c.x) * fine;
-  g *= mix(vec3(1.0), vec3(0.72, 0.85, 0.92), dab * step(0.8, c.y));
-  g *= mix(vec3(1.0), vec3(1.26, 1.13, 0.84), dab * step(c.y, 0.15));
-  g = mix(g, c.z > 0.985 ? vec3(0.88, 0.86, 0.78) : vec3(0.86, 0.8, 0.4), smoothstep(0.3, 0.42, c.x) * fine * step(0.965, c.z) * 0.6);
+  if (fine > 0.001) {
+    vec3 c = paintCells(q * 220.0);
+    float dab = smoothstep(0.1, 0.22, c.x) * fine;
+    g *= mix(vec3(1.0), vec3(0.72, 0.85, 0.92), dab * step(0.8, c.y));
+    g *= mix(vec3(1.0), vec3(1.26, 1.13, 0.84), dab * step(c.y, 0.15));
+    g = mix(g, c.z > 0.985 ? vec3(0.88, 0.86, 0.78) : vec3(0.86, 0.8, 0.4), smoothstep(0.3, 0.42, c.x) * fine * step(0.965, c.z) * 0.6);
+  }
   return g;
 }
 
@@ -288,7 +294,9 @@ float strokeCoord2(vec2 xz) {
 // across a pixel (a fragment shader's fwidth of it), which keeps a stroke the same few pixels thick anywhere.
 vec3 landStrokes(vec3 g, vec2 xz, float dist, float x, float w) {
   float far = smoothstep(70.0, 170.0, dist) * (1.0 - smoothstep(2600.0, 4600.0, dist));
+  if (far <= 0.001) return g;
   float line = 1.0 - smoothstep(1.5, 3.2, abs(fract(x) - 0.5) / max(w, 1e-5));
+  if (line <= 0.001) return g;
   float id = floor(x);
   // only here and there, and each for a different length
   float here = smoothstep(0.45, 0.53, texture(tNoiseHi, xz / 340.0 + id * 0.37).b);
@@ -300,23 +308,32 @@ vec3 landStrokes(vec3 g, vec2 xz, float dist, float x, float w) {
 vec3 paintGround(vec3 g, vec2 xz, float dist, float stones) {
   // at your feet, the brush's dabs, the same the blades take their tone from; gone by a hundred metres
   float nearK = 1.0 - smoothstep(40.0, 110.0, dist);
-  float t = ((texture(tStrokes, xz / 6.0).r - 0.5) * 0.5 + 0.7 * (texture(tStrokes, xz.yx / 27.0 + 0.37).r - 0.5) + 0.9 * (texture(tStrokes, xz / 95.0 + 0.11).r - 0.5)) * 0.7 * nearK;
   float farK = 1.0 - nearK;
-  // beyond, one slow change of green across the land,
-  t += (texture(tNoiseHi, xz / 1100.0 + 0.2).r - 0.5) * 0.5 * farK;
+  float t = nearK > 0.001
+    ? ((texture(tStrokes, xz / 6.0).r - 0.5) * 0.5 + 0.7 * (texture(tStrokes, xz.yx / 27.0 + 0.37).r - 0.5) + 0.9 * (texture(tStrokes, xz / 95.0 + 0.11).r - 0.5)) * 0.7 * nearK
+    : 0.0;
+  if (farK > 0.001) {
+    // beyond, one slow change of green across the land,
+    t += (texture(tNoiseHi, xz / 1100.0 + 0.2).r - 0.5) * 0.5 * farK;
+  }
   g *= (1.0 + t * 0.5) * mix(vec3(0.9, 1.0, 1.1), vec3(1.1, 1.03, 0.84), clamp(0.5 + t * 1.4, 0.0, 1.0));
-  // and on it, as on the far hills, soft patches at two sizes: a sunlit yellower green here, a deeper bluer one
-  // there. They differ in colour more than in tone and their edges are soft, which is what keeps them paint and
-  // not blotches.
-  float v = texture(tNoiseHi, xz / 520.0 + 0.2).g * 0.58 + texture(tNoiseHi, xz / 170.0 + 0.61).b * 0.42;
-  g *= mix(vec3(1.0), vec3(1.26, 1.13, 0.76), smoothstep(0.5, 0.62, v) * farK * 0.4);
-  g *= mix(vec3(1.0), vec3(0.76, 0.92, 1.06), (1.0 - smoothstep(0.36, 0.48, v)) * farK * 0.4);
-  // a few tufts of longer grass standing darker in it: short dashes lying across the view, on the nearer ground only
-  vec2 q = vec2(dot(xz, vec2(-uFloor.y, uFloor.x)) / 130.0, dot(xz, uFloor.xy) / 64.0);
-  float tuft = 1.0 - smoothstep(0.13, 0.2, texture(tStrokes, q).r);
-  g *= mix(vec3(1.0), vec3(0.7, 0.86, 0.9), tuft * farK * (1.0 - smoothstep(350.0, 800.0, dist)) * 0.6);
+  if (farK > 0.001) {
+    // and on it, as on the far hills, soft patches at two sizes: a sunlit yellower green here, a deeper bluer one
+    // there. They differ in colour more than in tone and their edges are soft, which is what keeps them paint and
+    // not blotches.
+    float v = texture(tNoiseHi, xz / 520.0 + 0.2).g * 0.58 + texture(tNoiseHi, xz / 170.0 + 0.61).b * 0.42;
+    g *= mix(vec3(1.0), vec3(1.26, 1.13, 0.76), smoothstep(0.5, 0.62, v) * farK * 0.4);
+    g *= mix(vec3(1.0), vec3(0.76, 0.92, 1.06), (1.0 - smoothstep(0.36, 0.48, v)) * farK * 0.4);
+    // a few tufts of longer grass standing darker in it: short dashes lying across the view, on the nearer ground only
+    float tuftMask = farK * (1.0 - smoothstep(350.0, 800.0, dist)) * 0.6;
+    if (tuftMask > 0.001) {
+      vec2 q = vec2(dot(xz, vec2(-uFloor.y, uFloor.x)) / 130.0, dot(xz, uFloor.xy) / 64.0);
+      float tuft = 1.0 - smoothstep(0.13, 0.2, texture(tStrokes, q).r);
+      g *= mix(vec3(1.0), vec3(0.7, 0.86, 0.9), tuft * tuftMask);
+    }
+  }
   // (a far meadow in the sun is a lighter, yellower green than the grass at your feet, which you see into)
-  return g * mix(vec3(1.0), vec3(1.16, 1.1, 0.9), 1.0 - nearK);
+  return g * mix(vec3(1.0), vec3(1.16, 1.1, 0.9), farK);
 }
 
 vec3 paintGroundOld(vec3 g, vec2 xz, float dist, float stones) {

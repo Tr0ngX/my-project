@@ -227,6 +227,7 @@ out vec3 vWorld;
 out float vTone;
 out float vKind;
 out vec2 vLocal;   // across the picture from its lit side, and up it
+out float vCloud;
 void main() {
   vec3 to = uCamPos - aAt;
   vec2 right = normalize(vec2(to.z, -to.x));
@@ -236,6 +237,10 @@ void main() {
   // the picture is lit from its left: turn it so that is the side the sun is on
   float cu = position.x * 0.5 + 0.5;
   if (dot(right, uSunDir.xz) > 0.0) cu = 1.0 - cu;
+  vec2 cp = (world.xz - uWindScroll * 2.6) / 3400.0;
+  float cc = textureLod(tNoiseHi, cp, 0.0).b * 0.7 + textureLod(tNoiseHi, cp * 2.7 + 0.19, 0.0).a * 0.3;
+  float cOpen = 1.0 - uCloudShade * smoothstep(0.47, 0.6, cc);
+  vCloud = mix(0.4, 1.0, clamp((cOpen - 0.5) * 2.0, 0.0, 1.0));
   vUv = vec2((aLook.x + clamp(cu, 0.006, 0.994)) / 8.0, position.y);
   vWorld = world;
   vTone = aLook.y;
@@ -249,15 +254,23 @@ const treeFragment = /* glsl */ `
 ${COMMON}
 layout(location = 0) out vec4 outC;
 uniform sampler2D tTrees;
+uniform float uCutout;
 in vec2 vUv;
 in vec3 vWorld;
 in float vTone;
 in float vKind;
 in vec2 vLocal;
+in float vCloud;
 void main() {
   vec4 t = texture(tTrees, vUv);
-  float a = clamp((t.a - 0.42) / max(fwidth(t.a), 1e-4) + 0.5, 0.0, 1.0);
-  if (a < 0.04) discard;
+  float a = t.a;
+  if (uCutout > 0.5) {
+    if (a < 0.415) discard;
+    a = 1.0;
+  } else {
+    a = clamp((a - 0.42) / max(fwidth(a), 1e-4) + 0.5, 0.0, 1.0);
+    if (a < 0.04) discard;
+  }
   float fir = step(vKind, 1.5);
   vec3 shade = mix(vec3(0.02, 0.13, 0.11), vec3(0.016, 0.11, 0.11), fir);
   vec3 half_ = mix(vec3(0.055, 0.26, 0.12), vec3(0.035, 0.2, 0.12), fir);
@@ -273,8 +286,7 @@ void main() {
   col *= 0.8 + 0.4 * vTone;
   // a wood seen from off is rows of tops: each lighter where it stands clear, darker down where the next row hides it
   col *= mix(0.8, 1.2, smoothstep(0.1, 0.9, vUv.y));
-  float cloud = cloudAt(vWorld.xz);
-  col *= uSkyColor * 0.5 + dot(uSkyColor, vec3(0.22)) + uSunColor * (0.2 + 0.16 * smoothstep(0.5, 0.8, form)) * mix(0.4, 1.0, clamp((cloud - 0.5) * 2.0, 0.0, 1.0));
+  col *= uSkyColor * 0.5 + dot(uSkyColor, vec3(0.22)) + uSunColor * (0.2 + 0.16 * smoothstep(0.5, 0.8, form)) * vCloud;
   outC = vec4(mix(col, applyFog(col, vWorld), 0.55), a);
 }
 `;
@@ -431,7 +443,7 @@ function sailsGeometry() {
   return building(pos, nor, parts);
 }
 
-export function createFarWoods(field) {
+export function createFarWoods(field, { cutout = false, start = [0, 0], viewDistance = 3600, initialRadius = Math.min(viewDistance, 2200) } = {}) {
   const group = new THREE.Group();
   const random = mulberry(1967);
 
@@ -546,24 +558,132 @@ export function createFarWoods(field) {
     else place(u, v, 2 + (random() < 0.5 ? 0 : 1), 18 + 8 * random(), 11 + 4 * random());
   }
 
-  const quad = new THREE.InstancedBufferGeometry();
-  quad.setAttribute('position', new THREE.Float32BufferAttribute([-1, 0, 0, 1, 0, 0, 1, 1, 0, -1, 1, 0], 3));
-  quad.setIndex([0, 1, 2, 0, 2, 3]);
-  quad.setAttribute('aAt', new THREE.InstancedBufferAttribute(new Float32Array(at), 3));
-  quad.setAttribute('aDim', new THREE.InstancedBufferAttribute(new Float32Array(dim), 2));
-  quad.setAttribute('aLook', new THREE.InstancedBufferAttribute(new Float32Array(look), 2));
-  quad.instanceCount = at.length / 3;
   const treeMaterial = new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
     vertexShader: treeVertex,
     fragmentShader: treeFragment,
-    uniforms: { ...field.uniforms, tTrees: { value: treePictures() } },
+    uniforms: { ...field.uniforms, tTrees: { value: treePictures() }, uCutout: { value: cutout ? 1 : 0 } },
     side: THREE.DoubleSide,
-    alphaToCoverage: true,
+    alphaToCoverage: !cutout,
   });
-  const trees = new THREE.Mesh(quad, treeMaterial);
-  trees.frustumCulled = false;
-  group.add(trees);
+  const basePos = new THREE.Float32BufferAttribute([-1, 0, 0, 1, 0, 0, 1, 1, 0, -1, 1, 0], 3);
+  const baseIdx = new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1);
+  // Spatial chunks enable lazy construction, distance streaming, and hardware frustum culling.
+  const cell = 1400;
+  const buckets = new Map();
+  const totalTrees = at.length / 3;
+  for (let i = 0; i < totalTrees; i++) {
+    const x = at[i * 3];
+    const z = at[i * 3 + 2];
+    const key = `${Math.floor(x / cell)},${Math.floor(z / cell)}`;
+    let bucket = buckets.get(key);
+    if (!bucket) buckets.set(key, (bucket = []));
+    bucket.push(i);
+  }
+  const chunkList = [];
+  for (const list of buckets.values()) {
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (let k = 0; k < list.length; k++) {
+      const idx = list[k];
+      const i3 = idx * 3;
+      const i2 = idx * 2;
+      const x = at[i3], y = at[i3 + 1], z = at[i3 + 2];
+      const w = dim[i2], h = dim[i2 + 1];
+      const hw = w * 0.6 + 2;
+      if (x - hw < minX) minX = x - hw;
+      if (x + hw > maxX) maxX = x + hw;
+      if (y - 1 < minY) minY = y - 1;
+      if (y + h + 2 > maxY) maxY = y + h + 2;
+      if (z - hw < minZ) minZ = z - hw;
+      if (z + hw > maxZ) maxZ = z + hw;
+    }
+    const cx = (minX + maxX) * 0.5;
+    const cy = (minY + maxY) * 0.5;
+    const cz = (minZ + maxZ) * 0.5;
+    const hzRadius = Math.hypot(maxX - minX, maxZ - minZ) * 0.5;
+    const sphere = new THREE.Sphere(new THREE.Vector3(cx, cy, cz), Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) * 0.5);
+    chunkList.push({ list, cx, cz, hzRadius, sphere, built: false, visible: false, mesh: null });
+  }
+
+  let currentViewDistance = Math.max(800, Number(viewDistance) || 3600);
+  let lastCamX = start[0] ?? 0;
+  let lastCamZ = start[1] ?? 0;
+  let builtCount = 0;
+  let visibleCount = 0;
+
+  const buildChunk = (desc) => {
+    if (desc.built) return;
+    const list = desc.list;
+    const n = list.length;
+    const cAt = new Float32Array(n * 3);
+    const cDim = new Float32Array(n * 2);
+    const cLook = new Float32Array(n * 2);
+    for (let k = 0; k < n; k++) {
+      const idx = list[k];
+      const i3 = idx * 3;
+      const i2 = idx * 2;
+      cAt[k * 3] = at[i3];
+      cAt[k * 3 + 1] = at[i3 + 1];
+      cAt[k * 3 + 2] = at[i3 + 2];
+      cDim[k * 2] = dim[i2];
+      cDim[k * 2 + 1] = dim[i2 + 1];
+      cLook[k * 2] = look[i2];
+      cLook[k * 2 + 1] = look[i2 + 1];
+    }
+    const quad = new THREE.InstancedBufferGeometry();
+    quad.setAttribute('position', basePos);
+    quad.setIndex(baseIdx);
+    quad.setAttribute('aAt', new THREE.InstancedBufferAttribute(cAt, 3));
+    quad.setAttribute('aDim', new THREE.InstancedBufferAttribute(cDim, 2));
+    quad.setAttribute('aLook', new THREE.InstancedBufferAttribute(cLook, 2));
+    quad.instanceCount = n;
+    const mesh = new THREE.Mesh(quad, treeMaterial);
+    mesh.boundingSphere = desc.sphere;
+    desc.mesh = mesh;
+    desc.list = null;
+    desc.built = true;
+    builtCount++;
+    group.add(mesh);
+  };
+
+  const syncChunks = (camX, camZ, { budgetMs = 1.6, force = false, radiusLimit = currentViewDistance, preloadPad = 240 } = {}) => {
+    lastCamX = camX;
+    lastCamZ = camZ;
+    const pending = [];
+    for (let i = 0; i < chunkList.length; i++) {
+      const desc = chunkList[i];
+      const dist = Math.hypot(desc.cx - camX, desc.cz - camZ);
+      const showDist = radiusLimit + desc.hzRadius;
+      if (desc.built) {
+        const wantVis = desc.visible ? dist <= showDist + 40 : dist <= showDist;
+        if (wantVis !== desc.visible) {
+          desc.visible = wantVis;
+          desc.mesh.visible = wantVis;
+          visibleCount += wantVis ? 1 : -1;
+        }
+      } else if (dist <= showDist + preloadPad) {
+        pending.push({ desc, gap: dist - desc.hzRadius });
+      }
+    }
+    if (!pending.length) return;
+    pending.sort((a, b) => a.gap - b.gap);
+    const t0 = performance.now();
+    const maxBuild = force ? pending.length : 2;
+    let builtNow = 0;
+    for (let i = 0; i < pending.length; i++) {
+      if (!force && builtNow > 0 && (builtNow >= maxBuild || performance.now() - t0 >= budgetMs)) break;
+      const { desc, gap } = pending[i];
+      buildChunk(desc);
+      const vis = gap <= radiusLimit;
+      desc.visible = vis;
+      desc.mesh.visible = vis;
+      if (vis) visibleCount++;
+      builtNow++;
+    }
+  };
+
+  syncChunks(lastCamX, lastCamZ, { force: true, radiusLimit: Math.max(0, Number(initialRadius) || 0), preloadPad: 0 });
 
   // ---- the village and the farmsteads ----
   const houseMaterial = createBuildingMaterial(field);
@@ -604,6 +724,17 @@ export function createFarWoods(field) {
     update(dt, wind) {
       angle -= dt * (0.2 + wind * 0.07);
       sails.quaternion.copy(facing).multiply(spin.setFromAxisAngle(axis, angle));
+    },
+    /** Updates lazy outer-stand chunk visibility and builds nearby unbuilt chunks within `budgetMs`. */
+    updateChunks(camX, camZ, opts) {
+      syncChunks(camX, camZ, opts);
+    },
+    setViewDistance(meters) {
+      currentViewDistance = Math.max(800, Number(meters) || 3600);
+      syncChunks(lastCamX, lastCamZ, { budgetMs: 1.8 });
+    },
+    stats() {
+      return { totalChunks: chunkList.length, builtChunks: builtCount, visibleChunks: visibleCount, viewDistance: currentViewDistance };
     },
   };
 }

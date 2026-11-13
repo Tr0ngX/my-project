@@ -422,12 +422,16 @@ export function createClouds(renderer, hero, { size = 1024, steps = 110, live = 
   scene.add(mesh);
   const camera = new THREE.Camera();
 
-  // the five faces that can hold cloud (not the one underfoot), each in four strips
+  // the five faces that can hold cloud (not the one underfoot), each in strips
   const FACES = [0, 1, 2, 4, 5];
-  const STRIPS = 8;
+  const STRIPS = 16;
+  const TOTAL_STRIPS = FACES.length * STRIPS;
   let unit = 0;
+  let dirtyStrips = 0;
   let cycleTime = 0;
   let time = 0;
+  const lastSun = new THREE.Vector3(NaN, NaN, NaN);
+  const lastLit = new THREE.Color(-1, -1, -1);
 
   function draw(face, strip) {
     const previous = renderer.getRenderTarget();
@@ -446,8 +450,20 @@ export function createClouds(renderer, hero, { size = 1024, steps = 110, live = 
     uniforms,
     /** The light on them. Any of: sunDir, lit, mid, shade, under, haze (colours in linear light). */
     setLight(l) {
-      if (l.sunDir) uniforms.uSunDir.value.copy(l.sunDir).normalize();
+      let changed = false;
+      if (l.sunDir) {
+        uniforms.uSunDir.value.copy(l.sunDir).normalize();
+        if (lastSun.distanceToSquared(uniforms.uSunDir.value) > 1e-6) {
+          lastSun.copy(uniforms.uSunDir.value);
+          changed = true;
+        }
+      }
       for (const [k, u] of [['lit', 'uLit'], ['mid', 'uMid'], ['shade', 'uShade'], ['under', 'uUnder'], ['haze', 'uHaze']]) if (l[k]) uniforms[u].value.copy(l[k]);
+      if (l.lit && (Math.abs(lastLit.r - uniforms.uLit.value.r) + Math.abs(lastLit.g - uniforms.uLit.value.g) + Math.abs(lastLit.b - uniforms.uLit.value.b)) > 1e-4) {
+        lastLit.copy(uniforms.uLit.value);
+        changed = true;
+      }
+      if (changed) dirtyStrips = TOTAL_STRIPS;
     },
     /** Every face, now: at the start, and whenever the light changes. */
     drawAll() {
@@ -455,15 +471,17 @@ export function createClouds(renderer, hero, { size = 1024, steps = 110, live = 
       uniforms.uTime.value = 0;
       for (const face of FACES) draw(face, -1);
       unit = 0;
+      dirtyStrips = 0;
     },
-    /** One strip of one face a frame: the clouds billow slowly, and nobody pays for it. */
+    /** One strip of one face a frame while light/sun changes; skips steady-state frames. */
     update(dt) {
       time += dt;
-      if (!live) return;
+      if (!live || dirtyStrips <= 0) return;
       if (unit === 0) cycleTime = time;
       uniforms.uTime.value = 0;
       draw(FACES[Math.floor(unit / STRIPS)], unit % STRIPS);
-      unit = (unit + 1) % (FACES.length * STRIPS);
+      unit = (unit + 1) % TOTAL_STRIPS;
+      dirtyStrips--;
     },
     compile: () => renderer.compileAsync(scene, camera),
   };
